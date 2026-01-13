@@ -585,9 +585,18 @@ def _stage_worker(
 
                 lock_files = acquired_lock_fds
         except Exception as e:
-            logger.debug("[Stage-%s] Failed to set up sequential initialization lock: %s", stage_id, e)
+            logger.debug(
+                "[Stage-%s] Failed to set up sequential initialization lock: %s",
+                stage_id,
+                e,
+            )
     # Init engine based on stage_type
-    logger.debug("[Stage-%s] Initializing %s engine with args keys=%s", stage_id, stage_type, list(engine_args.keys()))
+    logger.debug(
+        "[Stage-%s] Initializing %s engine with args keys=%s",
+        stage_id,
+        stage_type,
+        list(engine_args.keys()),
+    )
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage")
@@ -601,6 +610,7 @@ def _stage_worker(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
@@ -1104,11 +1114,26 @@ async def _stage_worker_async(
         # or when process dies
         for lock_fd in lock_files:
             try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 _os.close(lock_fd)
                 logger.debug("Released initialization lock (fd=%s)", lock_fd)
             except (OSError, ValueError):
                 pass
     omni_stage.set_async_engine(stage_engine)
+    if hasattr(omni_stage.async_engine, "log_stats") and omni_stage.async_engine.log_stats:
+
+        async def _force_log():
+            try:
+                while True:
+                    await asyncio.sleep(10.0)
+                    await omni_stage.async_engine.do_log_stats()
+            except asyncio.CancelledError:
+                pass
+
+        log_stats_task = asyncio.create_task(_force_log())
+    else:
+        log_stats_task = None
+
     # Don't keep the dummy data in memory (only for LLM engines)
     if stage_type != "diffusion":
         await stage_engine.reset_mm_cache()
@@ -1224,6 +1249,7 @@ async def _stage_worker_async(
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                    _gen_t0 = _gen_t1
                     await generation_out_q.put((rid, gen_output, _gen_ms))
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
@@ -1332,7 +1358,8 @@ async def _stage_worker_async(
                     }
                 )
             logger.debug("Enqueued result for request %s to downstream", rid)
-
+    if log_stats_task is not None:
+        log_stats_task.cancel()
     logger.info("Stage worker exiting")
 
 
