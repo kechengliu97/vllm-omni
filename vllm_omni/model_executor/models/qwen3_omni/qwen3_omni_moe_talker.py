@@ -20,7 +20,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear, RowParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -553,8 +553,12 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
 
     def __init__(self, config: Qwen3OmniMoeTalkerConfig):
         super().__init__()
-        self.linear_fc1 = nn.Linear(config.thinker_hidden_size, config.text_config.intermediate_size, bias=True)
-        self.linear_fc2 = nn.Linear(config.text_config.intermediate_size, config.text_config.hidden_size, bias=True)
+        self.linear_fc1 = ColumnParallelLinear(
+            config.thinker_hidden_size, config.text_config.intermediate_size, bias=True, return_bias=False
+        )
+        self.linear_fc2 = RowParallelLinear(
+            config.text_config.intermediate_size, config.text_config.hidden_size, bias=True, return_bias=False
+        )
         self.act_fn = _ACTIVATION_REGISTRY[config.text_config.hidden_act]  # silu
 
     def forward(self, hidden_state):
