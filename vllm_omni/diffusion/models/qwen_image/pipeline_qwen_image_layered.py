@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenImageTransformer2DModel,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -211,18 +212,8 @@ class QwenImageLayeredPipeline(nn.Module, SupportImageInput):
             )
         ]
 
-        use_additional_t_cond = od_config.tf_model_config.use_additional_t_cond
-        zero_cond_t = od_config.tf_model_config.zero_cond_t
-        use_layer3d_rope = od_config.tf_model_config.use_layer3d_rope
-        guidance_embeds = od_config.tf_model_config.guidance_embeds
-
-        self.transformer = QwenImageTransformer2DModel(
-            od_config=od_config,
-            use_additional_t_cond=use_additional_t_cond,
-            zero_cond_t=zero_cond_t,
-            use_layer3d_rope=use_layer3d_rope,
-            guidance_embeds=guidance_embeds,
-        )
+        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, QwenImageTransformer2DModel)
+        self.transformer = QwenImageTransformer2DModel(od_config=od_config, **transformer_kwargs)
 
         # Pipeline configuration & processing parameters
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
@@ -731,6 +722,8 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         num_inference_steps = req.num_inference_steps or num_inference_steps
         generator = req.generator or generator
         true_cfg_scale = req.true_cfg_scale or true_cfg_scale
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
         req_num_outputs = getattr(req, "num_outputs_per_prompt", None)
         if req_num_outputs and req_num_outputs > 0:
             num_images_per_prompt = req_num_outputs

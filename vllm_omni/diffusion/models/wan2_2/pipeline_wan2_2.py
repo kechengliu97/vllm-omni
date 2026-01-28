@@ -9,7 +9,7 @@ from collections.abc import Iterable
 
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
@@ -18,6 +18,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
@@ -244,12 +245,13 @@ class Wan22Pipeline(nn.Module):
         else:
             self.transformer_2 = None
 
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+        # Initialize UniPC scheduler
+        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
+        self.scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=1000,
+            shift=flow_shift,
+            prediction_type="flow_prediction",
         )
-        # Apply flow_shift if specified (12.0 for 480p, 5.0 for 720p recommended for Wan2.2)
-        if od_config.flow_shift is not None:
-            self.scheduler.config.flow_shift = od_config.flow_shift
 
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
@@ -276,17 +278,16 @@ class Wan22Pipeline(nn.Module):
     def current_timestep(self):
         return self._current_timestep
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
         prompt: str | None = None,
         negative_prompt: str | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int | None = None,
+        height: int = 480,
+        width: int = 832,
+        num_inference_steps: int = 40,
         guidance_scale: float | tuple[float, float] = 4.0,
-        frame_num: int | None = None,
+        frame_num: int = 81,
         output_type: str | None = "np",
         generator: torch.Generator | None = None,
         prompt_embeds: torch.Tensor | None = None,
@@ -299,9 +300,9 @@ class Wan22Pipeline(nn.Module):
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
-        height = req.height or height or 720
-        width = req.width or width or 1280
-        num_frames = req.num_frames if req.num_frames else frame_num or 81
+        height = req.height or height
+        width = req.width or width
+        num_frames = req.num_frames if req.num_frames else frame_num
 
         # Ensure dimensions are compatible with VAE and patch size
         # For expand_timesteps mode, we need latent dims to be even (divisible by patch_size)
@@ -309,7 +310,11 @@ class Wan22Pipeline(nn.Module):
         mod_value = self.vae_scale_factor_spatial * patch_size[1]  # 16*2=32 for TI2V, 8*2=16 for I2V
         height = (height // mod_value) * mod_value
         width = (width // mod_value) * mod_value
-        num_steps = req.num_inference_steps or num_inference_steps or 40
+        num_steps = req.num_inference_steps or num_inference_steps
+
+        # Respect per-request guidance_scale when explicitly provided.
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
 
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
         guidance_high = (

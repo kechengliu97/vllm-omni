@@ -9,7 +9,7 @@ from collections.abc import Iterable
 import numpy as np
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+from diffusers import AutoencoderKLWan
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
@@ -18,6 +18,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     create_transformer_from_config,
     load_transformer_config,
@@ -112,7 +114,7 @@ def get_wan22_i2v_pre_process_func(
     return pre_process_func
 
 
-class Wan22I2VPipeline(nn.Module):
+class Wan22I2VPipeline(nn.Module, SupportImageInput):
     """
     Wan2.2 Image-to-Video Pipeline.
 
@@ -198,12 +200,13 @@ class Wan22I2VPipeline(nn.Module):
         else:
             self.transformer_2 = None
 
-        # Scheduler
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model, subfolder="scheduler", local_files_only=local_files_only
+        # Initialize UniPC scheduler
+        flow_shift = od_config.flow_shift if od_config.flow_shift is not None else 5.0  # default for 720p
+        self.scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=1000,
+            shift=flow_shift,
+            prediction_type="flow_prediction",
         )
-        if od_config.flow_shift is not None:
-            self.scheduler.config.flow_shift = od_config.flow_shift
 
         # VAE scale factors
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if hasattr(self.vae, "config") else 4
@@ -251,18 +254,17 @@ class Wan22I2VPipeline(nn.Module):
         image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
 
-    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         image: PIL.Image.Image | torch.Tensor | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int | None = None,
+        height: int = 480,
+        width: int = 832,
+        num_inference_steps: int = 40,
         guidance_scale: float | tuple[float, float] = 5.0,
-        frame_num: int | None = None,
+        frame_num: int = 81,
         output_type: str | None = "np",
         generator: torch.Generator | None = None,
         prompt_embeds: torch.Tensor | None = None,
@@ -284,10 +286,14 @@ class Wan22I2VPipeline(nn.Module):
         if image is None:
             raise ValueError("Image is required for I2V generation.")
 
-        height = req.height or height or 480
-        width = req.width or width or 832
-        num_frames = req.num_frames if req.num_frames else frame_num or 81
-        num_steps = req.num_inference_steps or num_inference_steps or 50
+        height = req.height or height
+        width = req.width or width
+        num_frames = req.num_frames if req.num_frames else frame_num
+        num_steps = req.num_inference_steps or num_inference_steps
+
+        # Respect per-request guidance_scale when explicitly provided.
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
 
         # Handle guidance scales
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
