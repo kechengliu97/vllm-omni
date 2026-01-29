@@ -653,7 +653,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
-
+        modality_token_stats = dict()
         try:
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
@@ -670,6 +670,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # Initialize role before conditional blocks to avoid UnboundLocalError
                 # when handling audio/image responses
                 role = self.get_chat_request_role(request)
+
+                stats = modality_token_stats.setdefault(
+                    final_output_type,
+                    {
+                        "prompt_token_num": 0,
+                        "output_token_num": 0,
+                        "total_token_num": 0,
+                    },
+                )
+                output_token_num = len(res.outputs[0].token_ids)
+                stats["prompt_token_num"] = num_prompt_tokens
+                stats["output_token_num"] = output_token_num
+                stats["total_token_num"] = num_prompt_tokens + output_token_num
 
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
@@ -1291,7 +1304,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             data = self.create_streaming_error_response(str(e))
             yield f"data: {data}\n\n"
         # Send the final done message after all response.n are finished
-        yield "data: [DONE]\n\n"
+        modality_stats_json = json.dumps(modality_token_stats)
+        yield f"data: [DONE], stats: {modality_stats_json}\n\n"
 
     async def chat_completion_full_generator(
         self,

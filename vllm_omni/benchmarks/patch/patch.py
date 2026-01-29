@@ -134,7 +134,7 @@ async def async_request_openai_chat_omni_completions(
 
                         chunk = message.removeprefix("data: ")
 
-                        if chunk != "[DONE]":
+                        if "[DONE]" not in chunk:
                             timestamp = time.perf_counter()
                             data = json.loads(chunk)
                             if choices := data.get("choices"):
@@ -165,6 +165,10 @@ async def async_request_openai_chat_omni_completions(
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get("completion_tokens")
                             most_recent_timestamp = timestamp
+                        else:
+                            output.output_tokens = (
+                                json.loads(chunk.split("stats: ", 1)[1]).get("text").get("output_token_num", 0)
+                            )
 
                 output.generated_text = generated_text
                 if generated_audio is not None:
