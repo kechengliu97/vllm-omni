@@ -654,6 +654,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         include_usage, include_continuous_usage = should_include_usage(stream_options, self.enable_force_include_usage)
 
         try:
+            flag_token_in_of_thinker = False
+            flag_token_out_of_thinker = False
+            token_num_in_of_thinker = 0
+            token_num_out_of_thinker = 0
+
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
                 res = omni_res.request_output
@@ -663,8 +668,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
+
+                    if not flag_token_in_of_thinker:
+                        token_num_in_of_thinker = num_prompt_tokens
+                        flag_token_in_of_thinker = True
+
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
+
+                    if not flag_token_out_of_thinker and res.finished:
+                        token_num_out_of_thinker = len(res.outputs[0].token_ids)
+                        flag_token_out_of_thinker = True
 
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
@@ -1228,7 +1242,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         completion_tokens=0,
                         total_tokens=num_prompt_tokens,
                     )
-                    data = chunk.model_dump_json(exclude_unset=True)
+                    chunk_dict = chunk.model_dump(exclude_unset=True)
+                    chunk_dict["OmniUsageInfo"] = {
+                        "thinker_input_token_num": token_num_in_of_thinker,
+                        "thinker_output_token_num": token_num_out_of_thinker,
+                        "code2wav_output_token_num": num_prompt_tokens,
+                    }
+                    data = json.dumps(chunk_dict)
                     yield f"data: {data}\n\n"
 
                 else:
