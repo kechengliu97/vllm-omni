@@ -49,8 +49,10 @@ class CFGParallelMixin(metaclass=ABCMeta):
             Predicted noise tensor (only valid on rank 0 in CFG parallel mode)
         """
         if do_true_cfg:
-            # Automatically detect CFG parallel configuration
-            cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
+            # CFG-parallel currently assumes a strict positive/negative split
+            # across exactly 2 ranks.
+            cfg_world_size = get_classifier_free_guidance_world_size()
+            cfg_parallel_ready = cfg_world_size == 2
 
             if cfg_parallel_ready:
                 # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
@@ -215,7 +217,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             Updated latents (synchronized across all CFG ranks)
         """
         # Automatically detect CFG parallel configuration
-        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() > 1
+        cfg_parallel_ready = do_true_cfg and get_classifier_free_guidance_world_size() == 2
 
         if cfg_parallel_ready:
             cfg_group = get_cfg_group()

@@ -14,7 +14,11 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 
 logger = logging.getLogger(__name__)
@@ -69,6 +73,29 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         self.scheduler.set_begin_index(0)
         self.transformer.do_true_cfg = do_true_cfg
         additional_transformer_kwargs = additional_transformer_kwargs or {}
+
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        cfg_parallel_ready = do_true_cfg and cfg_world_size > 1
+        if cfg_parallel_ready:
+            cfg_group = get_cfg_group()
+            cfg_rank = get_classifier_free_guidance_rank()
+
+            # Keep positive/negative branches on the same latent trajectory.
+            # Without this sync, each rank may start from different random noise,
+            # causing large output deviations from sequential CFG.
+            latents = latents.contiguous()
+            cfg_group.broadcast(latents, src=0)
+
+            if image_latents is not None:
+                image_latents = image_latents.contiguous()
+                cfg_group.broadcast(image_latents, src=0)
+
+            if cfg_rank > 1:
+                logger.warning(
+                    "CFG parallel world_size=%d is enabled, but Qwen-Image CFG logic consumes only one positive "
+                    "and one negative branch. Extra CFG ranks will compute redundant negative branches.",
+                    cfg_world_size,
+                )
 
         with self.progress_bar(total=len(timesteps)) as pbar:
             for i, t in enumerate(timesteps):
@@ -151,6 +178,14 @@ class QwenImageCFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
         """
         if get_classifier_free_guidance_world_size() == 1:
             return True
+
+        if get_classifier_free_guidance_world_size() != 2:
+            logger.warning(
+                "Qwen-Image CFG parallel expects cfg_parallel_size=2 for strict positive/negative pairing, "
+                "but got cfg_parallel_size=%d.",
+                get_classifier_free_guidance_world_size(),
+            )
+            return False
 
         if true_cfg_scale <= 1:
             logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
