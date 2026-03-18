@@ -6,7 +6,6 @@ Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
-import os
 from typing import Any
 
 import torch
@@ -25,46 +24,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
     All pipelines should inherit from this class to reuse
     classifier-free guidance logic.
     """
-
-    _CFG_ORIGINAL_LOG_PATH = "/home/l30053556/cfg-fix/noise_input_original.log"
-    _CFG_PARALLEL_LOG_PATH = "/home/l30053556/cfg-fix/noise_input_parallel.log"
-
-    def _next_noise_debug_step(self) -> int:
-        step = getattr(self, "_cfg_noise_debug_step", 0) + 1
-        self._cfg_noise_debug_step = step
-        return step
-
-    @staticmethod
-    def _format_single_value(v: Any) -> str:
-        """Format one value: tensor → stats summary, anything else → repr."""
-        if not isinstance(v, torch.Tensor):
-            return repr(v)
-        t = v.detach().float()
-        flat = t.reshape(-1)
-        preview_count = min(4, flat.numel())
-        preview = ", ".join(f"{float(x):.6g}" for x in flat[:preview_count].cpu())
-        return (
-            f"Tensor(shape={tuple(v.shape)}, dtype={v.dtype}, "
-            f"mean={float(t.mean().item()):.6g}, std={float(t.std(unbiased=False).item()):.6g}, "
-            f"min={float(t.min().item()):.6g}, max={float(t.max().item()):.6g}, "
-            f"preview=[{preview}])"
-        )
-
-    def _format_kwargs(self, kwargs: dict[str, Any] | None) -> str:
-        """Dump every key-value pair in kwargs as a readable string."""
-        if not kwargs:
-            return "{}"
-        parts = [f"{k}={self._format_single_value(v)}" for k, v in kwargs.items()]
-        return "{" + ", ".join(parts) + "}"
-
-    def _append_noise_debug_log(self, log_path: str, message: str) -> None:
-        try:
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(message + "\n")
-        except Exception:
-            # Debug logging must never break generation.
-            pass
 
     def predict_noise_maybe_with_cfg(
         self,
@@ -89,8 +48,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Predicted noise tensor (only valid on rank 0 in CFG parallel mode)
         """
-        debug_step = self._next_noise_debug_step()
-
         if do_true_cfg:
             # Automatically detect CFG parallel configuration
             cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
@@ -99,15 +56,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
                 cfg_group = get_cfg_group()
                 cfg_rank = get_classifier_free_guidance_rank()
-
-                self._append_noise_debug_log(
-                    self._CFG_PARALLEL_LOG_PATH,
-                    (
-                        f"step={debug_step}, rank={cfg_rank}, mode=parallel\n"
-                        f"  positive_kwargs={self._format_kwargs(positive_kwargs)}\n"
-                        f"  negative_kwargs={self._format_kwargs(negative_kwargs)}"
-                    ),
-                )
 
                 if cfg_rank == 0:
                     local_pred = self.predict_noise(**positive_kwargs)
@@ -129,15 +77,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     return None
             else:
                 # Sequential CFG: compute both positive and negative
-                self._append_noise_debug_log(
-                    self._CFG_ORIGINAL_LOG_PATH,
-                    (
-                        f"step={debug_step}, rank=0, mode=sequential\n"
-                        f"  positive_kwargs={self._format_kwargs(positive_kwargs)}\n"
-                        f"  negative_kwargs={self._format_kwargs(negative_kwargs)}"
-                    ),
-                )
-
                 positive_noise_pred = self.predict_noise(**positive_kwargs)
                 negative_noise_pred = self.predict_noise(**negative_kwargs)
 
