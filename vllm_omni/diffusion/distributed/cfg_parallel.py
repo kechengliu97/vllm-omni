@@ -6,6 +6,7 @@ Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
+import os
 from typing import Any
 
 import torch
@@ -24,6 +25,47 @@ class CFGParallelMixin(metaclass=ABCMeta):
     All pipelines should inherit from this class to reuse
     classifier-free guidance logic.
     """
+
+    _CFG_ORIGINAL_LOG_PATH = "/home/l30053556/cfg-fix/noise_input_original.log"
+    _CFG_PARALLEL_LOG_PATH = "/home/l30053556/cfg-fix/noise_input_parallel.log"
+
+    def _next_noise_debug_step(self) -> int:
+        step = getattr(self, "_cfg_noise_debug_step", 0) + 1
+        self._cfg_noise_debug_step = step
+        return step
+
+    def _format_tensor_stats(self, tensor: torch.Tensor) -> str:
+        if tensor is None:
+            return "None"
+        t = tensor.detach().float()
+        flat = t.reshape(-1)
+        preview_count = min(4, flat.numel())
+        preview = ", ".join(f"{float(v):.6g}" for v in flat[:preview_count].cpu())
+        return (
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"mean={float(t.mean().item()):.6g}, std={float(t.std(unbiased=False).item()):.6g}, "
+            f"min={float(t.min().item()):.6g}, max={float(t.max().item()):.6g}, "
+            f"preview=[{preview}]"
+        )
+
+    def _extract_input_tensor(self, kwargs: dict[str, Any] | None) -> torch.Tensor | None:
+        if not kwargs:
+            return None
+        if isinstance(kwargs.get("hidden_states"), torch.Tensor):
+            return kwargs["hidden_states"]
+        for v in kwargs.values():
+            if isinstance(v, torch.Tensor):
+                return v
+        return None
+
+    def _append_noise_debug_log(self, log_path: str, message: str) -> None:
+        try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(message + "\n")
+        except Exception:
+            # Debug logging must never break generation.
+            pass
 
     def predict_noise_maybe_with_cfg(
         self,
@@ -48,6 +90,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Predicted noise tensor (only valid on rank 0 in CFG parallel mode)
         """
+        debug_step = self._next_noise_debug_step()
+
         if do_true_cfg:
             # Automatically detect CFG parallel configuration
             cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
@@ -56,6 +100,15 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 # Enable CFG-parallel: rank0 computes positive, rank1 computes negative.
                 cfg_group = get_cfg_group()
                 cfg_rank = get_classifier_free_guidance_rank()
+
+                self._append_noise_debug_log(
+                    self._CFG_PARALLEL_LOG_PATH,
+                    (
+                        f"step={debug_step}, rank={cfg_rank}, mode=parallel, "
+                        f"pos={self._format_tensor_stats(self._extract_input_tensor(positive_kwargs))}, "
+                        f"neg={self._format_tensor_stats(self._extract_input_tensor(negative_kwargs))}"
+                    ),
+                )
 
                 if cfg_rank == 0:
                     local_pred = self.predict_noise(**positive_kwargs)
@@ -77,6 +130,15 @@ class CFGParallelMixin(metaclass=ABCMeta):
                     return None
             else:
                 # Sequential CFG: compute both positive and negative
+                self._append_noise_debug_log(
+                    self._CFG_ORIGINAL_LOG_PATH,
+                    (
+                        f"step={debug_step}, rank=0, mode=sequential, "
+                        f"pos={self._format_tensor_stats(self._extract_input_tensor(positive_kwargs))}, "
+                        f"neg={self._format_tensor_stats(self._extract_input_tensor(negative_kwargs))}"
+                    ),
+                )
+
                 positive_noise_pred = self.predict_noise(**positive_kwargs)
                 negative_noise_pred = self.predict_noise(**negative_kwargs)
 
