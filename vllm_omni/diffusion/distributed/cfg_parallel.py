@@ -6,6 +6,7 @@ Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -127,6 +128,8 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Combined noise prediction tensor
         """
+        # Keep a copy of conditional prediction before CFG combine for debugging.
+        noise_pred_input = noise_pred
         comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
         if cfg_normalize:
@@ -134,7 +137,38 @@ class CFGParallelMixin(metaclass=ABCMeta):
         else:
             noise_pred = comb_pred
 
+        self._dump_combine_cfg_tensors(
+            neg_noise_pred=neg_noise_pred,
+            noise_pred_input=noise_pred_input,
+            comb_pred=comb_pred,
+            noise_pred_output=noise_pred,
+        )
+
         return noise_pred
+
+    def _dump_combine_cfg_tensors(
+        self,
+        neg_noise_pred: torch.Tensor,
+        noise_pred_input: torch.Tensor,
+        comb_pred: torch.Tensor,
+        noise_pred_output: torch.Tensor,
+    ) -> None:
+        dump_dir = Path("/home/l30053556/cfg-fix/combine_result/original/")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        idx = getattr(self, "_combine_cfg_noise_dump_idx", 0)
+        setattr(self, "_combine_cfg_noise_dump_idx", idx + 1)
+
+        tensors_to_dump = {
+            "neg_noise_pred": neg_noise_pred,
+            "noise_pred_input": noise_pred_input,
+            "comb_pred": comb_pred,
+            "noise_pred_output": noise_pred_output,
+        }
+
+        for name, tensor in tensors_to_dump.items():
+            file_path = dump_dir / f"idx_{idx}_{name}.pt"
+            torch.save(tensor.detach().cpu(), file_path)
 
     def predict_noise(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """
