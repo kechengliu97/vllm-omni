@@ -6,7 +6,9 @@ from __future__ import annotations
 from collections.abc import Iterable
 from functools import lru_cache
 from math import prod
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+import json
 
 import torch
 import torch.nn as nn
@@ -45,6 +47,19 @@ from vllm_omni.diffusion.layers.adalayernorm import AdaLayerNorm
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 logger = init_logger(__name__)
+
+_CFG_DEBUG_ROOT = Path("/home/l30053556/cfg-fix/negative_kwargs")
+
+
+def _tensor_stats(t: torch.Tensor) -> dict[str, float]:
+    t32 = t.detach().float()
+    return {
+        "mean": float(t32.mean().item()),
+        "std": float(t32.std().item()),
+        "abs_mean": float(t32.abs().mean().item()),
+        "abs_max": float(t32.abs().max().item()),
+        "l2": float(torch.norm(t32).item()),
+    }
 
 
 class ImageRopePrepare(nn.Module):
@@ -772,6 +787,20 @@ class QwenImageTransformerBlock(nn.Module):
         # Process text stream - norm1 + modulation
         txt_modulated, txt_gate1 = self.txt_norm1(encoder_hidden_states, txt_mod1)
 
+        # ──── cross-attention encoder input debug ────────────────────────────────────────────
+        debug_branch = getattr(self, "_cfg_debug_branch", None)
+        block_idx = getattr(self, "block_idx", None)
+        
+        if debug_branch in {"parallel", "original"} and block_idx is not None and 20 <= block_idx <= 24:
+            s = _tensor_stats(txt_modulated)
+            print(
+                f"[cfg-debug:{debug_branch}] block_{block_idx:02d} txt_modulated (encoder→attn input): "
+                f"shape={txt_modulated.shape}, mean={s['mean']:.6f}, std={s['std']:.6f}, "
+                f"abs_mean={s['abs_mean']:.6f}, abs_max={s['abs_max']:.6f}",
+                flush=True
+            )
+        # ──────────────────────────────────────────────────────────────────────────────────────
+
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
         # 1. Computes QKV for both streams
@@ -789,6 +818,17 @@ class QwenImageTransformerBlock(nn.Module):
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
+
+        # ──── cross-attention encoder output debug ───────────────────────────────────────────
+        if debug_branch in {"parallel", "original"} and block_idx is not None and 20 <= block_idx <= 24:
+            s = _tensor_stats(txt_attn_output)
+            print(
+                f"[cfg-debug:{debug_branch}] block_{block_idx:02d} txt_attn_output (attn→encoder output): "
+                f"shape={txt_attn_output.shape}, mean={s['mean']:.6f}, std={s['std']:.6f}, "
+                f"abs_mean={s['abs_mean']:.6f}, abs_max={s['abs_max']:.6f}",
+                flush=True
+            )
+        # ──────────────────────────────────────────────────────────────────────────────────────
 
         # Apply attention gates and add residual (like in Megatron)
         hidden_states = hidden_states + img_gate1 * img_attn_output
@@ -1011,8 +1051,43 @@ class QwenImageTransformer2DModel(CachedTransformer):
         # This ensures modulate_index sequence dimension matches sharded hidden_states
         timestep, modulate_index = self.modulate_index_prepare(timestep, img_shapes)
 
+        # ──── encoder debug: input ────────────────────────────────────────────────────────────
+        debug_branch = getattr(self, "_cfg_debug_branch", None)
+        if debug_branch in {"parallel", "original"}:
+            s = _tensor_stats(encoder_hidden_states)
+            print(
+                f"[cfg-debug:{debug_branch}] encoder_hidden_states BEFORE txt_norm: "
+                f"shape={encoder_hidden_states.shape}, dtype={encoder_hidden_states.dtype}, "
+                f"mean={s['mean']:.6f}, std={s['std']:.6f}, abs_mean={s['abs_mean']:.6f}, abs_max={s['abs_max']:.6f}",
+                flush=True
+            )
+        # ──────────────────────────────────────────────────────────────────────────────────────
+
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+
+        # ──── encoder debug: after txt_norm ────────────────────────────────────────────────────
+        if debug_branch in {"parallel", "original"}:
+            s = _tensor_stats(encoder_hidden_states)
+            print(
+                f"[cfg-debug:{debug_branch}] encoder_hidden_states AFTER txt_norm: "
+                f"shape={encoder_hidden_states.shape}, dtype={encoder_hidden_states.dtype}, "
+                f"mean={s['mean']:.6f}, std={s['std']:.6f}, abs_mean={s['abs_mean']:.6f}, abs_max={s['abs_max']:.6f}",
+                flush=True
+            )
+        # ──────────────────────────────────────────────────────────────────────────────────────
+
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        # ──── encoder debug: after txt_in ────────────────────────────────────────────────────
+        if debug_branch in {"parallel", "original"}:
+            s = _tensor_stats(encoder_hidden_states)
+            print(
+                f"[cfg-debug:{debug_branch}] encoder_hidden_states AFTER txt_in: "
+                f"shape={encoder_hidden_states.shape}, dtype={encoder_hidden_states.dtype}, "
+                f"mean={s['mean']:.6f}, std={s['std']:.6f}, abs_mean={s['abs_mean']:.6f}, abs_max={s['abs_max']:.6f}",
+                flush=True
+            )
+        # ──────────────────────────────────────────────────────────────────────────────────────
 
         if guidance is not None:
             guidance = guidance.to(hidden_states.dtype) * 1000
@@ -1047,7 +1122,17 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 
+        debug_branch = getattr(self, "_cfg_debug_branch", None)
+        enable_block_debug = debug_branch in {"parallel", "original"} and not getattr(
+            self, f"_cfg_block_debug_done_{debug_branch}", False
+        )
+        block_debug_rows: list[dict[str, Any]] = [] if enable_block_debug else []
+
         for index_block, block in enumerate(self.transformer_blocks):
+            # Pass block index and debug branch to the block for cross-attention debug logging
+            block.block_idx = index_block
+            block._cfg_debug_branch = debug_branch
+            
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -1058,6 +1143,43 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
             )
+            
+            # ──── encoder debug: block 20-24 ──────────────────────────────────────────────────
+            if debug_branch in {"parallel", "original"} and 20 <= index_block <= 24:
+                s = _tensor_stats(encoder_hidden_states)
+                print(
+                    f"[cfg-debug:{debug_branch}] block_{index_block:02d} encoder_hidden_states AFTER block: "
+                    f"shape={encoder_hidden_states.shape}, dtype={encoder_hidden_states.dtype}, "
+                    f"mean={s['mean']:.6f}, std={s['std']:.6f}, abs_mean={s['abs_mean']:.6f}, abs_max={s['abs_max']:.6f}",
+                    flush=True
+                )
+            # ──────────────────────────────────────────────────────────────────────────────────
+            
+            if enable_block_debug:
+                block_debug_rows.append(
+                    {
+                        "block_idx": index_block,
+                        "hidden_states": _tensor_stats(hidden_states),
+                        "encoder_hidden_states": _tensor_stats(encoder_hidden_states),
+                    }
+                )
+
+        if enable_block_debug:
+            save_dir = _CFG_DEBUG_ROOT / debug_branch
+            save_dir.mkdir(parents=True, exist_ok=True)
+            save_path = save_dir / "block_stats.json"
+            meta = {
+                "branch": debug_branch,
+                "hidden_shape": list(hidden_states.shape),
+                "hidden_dtype": str(hidden_states.dtype),
+                "hidden_device": str(hidden_states.device),
+                "num_blocks": len(block_debug_rows),
+                "rows": block_debug_rows,
+            }
+            with save_path.open("w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=True, indent=2)
+            print(f"[cfg-block-debug] saved block stats to {save_path}", flush=True)
+            setattr(self, f"_cfg_block_debug_done_{debug_branch}", True)
 
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
