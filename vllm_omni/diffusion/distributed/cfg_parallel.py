@@ -6,7 +6,6 @@ Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
 from abc import ABCMeta
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -16,61 +15,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-
-# ── debug: one-time capture dirs ──────────────────────────────────────────────
-_DBG_PARALLEL_DIR = Path("/home/l30053556/cfg-fix/negative_kwargs/parallel")
-_DBG_ORIGINAL_DIR = Path("/home/l30053556/cfg-fix/negative_kwargs/original")
-_DBG_PARALLEL_DONE: bool = False
-_DBG_ORIGINAL_DONE: bool = False
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _dbg_save(
-    negative_kwargs: dict[str, Any],
-    output: torch.Tensor,
-    save_dir: Path,
-    branch: str,
-    transformer: Any = None,
-) -> None:
-    """
-    One-shot debug helper.
-
-    Saves to save_dir/:
-      negative_<key>.pt   – each tensor in negative_kwargs (CPU copy)
-      negative_output.pt  – the output of predict_noise (CPU copy)
-      meta.txt            – shapes, dtypes, device, model.training flag
-
-    Prints a summary so the output appears in the process log.
-    """
-    save_dir.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = [f"[cfg-debug:{branch}] ========================================"]
-
-    # model state
-    if transformer is not None:
-        lines.append(f"  transformer.training = {transformer.training}")
-        # print all unique devices that model parameters live on
-        param_devices = list({str(p.device) for p in transformer.parameters()})
-        lines.append(f"  parameter devices    = {param_devices}")
-
-    # save each tensor in negative_kwargs
-    for key, val in negative_kwargs.items():
-        if isinstance(val, torch.Tensor):
-            pt_path = save_dir / f"negative_{key}.pt"
-            torch.save(val.detach().cpu(), pt_path)
-            lines.append(f"  input  [{key}]: shape={val.shape}, dtype={val.dtype}, device={val.device}")
-        else:
-            lines.append(f"  input  [{key}]: {type(val).__name__} = {val}")
-
-    # save predict_noise output
-    out_path = save_dir / "negative_output.pt"
-    torch.save(output.detach().cpu(), out_path)
-    lines.append(f"  output : shape={output.shape}, dtype={output.dtype}, device={output.device}")
-    lines.append(f"  output : min={output.float().min().item():.6f}  max={output.float().max().item():.6f}  "
-                 f"mean={output.float().mean().item():.6f}  std={output.float().std().item():.6f}")
-    lines.append(f"[cfg-debug:{branch}] saved to {save_dir}")
-    lines.append(f"[cfg-debug:{branch}] ========================================")
-
-    print("\n".join(lines), flush=True)
 
 
 class CFGParallelMixin(metaclass=ABCMeta):
@@ -104,8 +48,6 @@ class CFGParallelMixin(metaclass=ABCMeta):
         Returns:
             Predicted noise tensor (only valid on rank 0 in CFG parallel mode)
         """
-        global _DBG_PARALLEL_DONE, _DBG_ORIGINAL_DONE
-
         if do_true_cfg:
             # Automatically detect CFG parallel configuration
             cfg_parallel_ready = get_classifier_free_guidance_world_size() > 1
@@ -118,34 +60,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 if cfg_rank == 0:
                     local_pred = self.predict_noise(**positive_kwargs)
                 else:
-                    transformer = getattr(self, "transformer", None)
-                    if transformer is not None:
-                        transformer._cfg_debug_branch = "parallel"
-                    # ── encoder debug logging ────────────────────────────────────────
-                    encoder_hs = negative_kwargs.get("encoder_hidden_states", None)
-                    if encoder_hs is not None and isinstance(encoder_hs, torch.Tensor):
-                        print(
-                            f"[cfg-debug:parallel] encoder_hidden_states input: "
-                            f"shape={encoder_hs.shape}, dtype={encoder_hs.dtype}, device={encoder_hs.device}, "
-                            f"mean={encoder_hs.float().mean().item():.6f}, "
-                            f"std={encoder_hs.float().std().item():.6f}, "
-                            f"abs_mean={encoder_hs.float().abs().mean().item():.6f}, "
-                            f"abs_max={encoder_hs.float().abs().max().item():.6f}",
-                            flush=True
-                        )
-                    # ──────────────────────────────────────────────────────────────────
-                    try:
-                        local_pred = self.predict_noise(**negative_kwargs)
-                    finally:
-                        if transformer is not None:
-                            transformer._cfg_debug_branch = None
-                    if not _DBG_PARALLEL_DONE:
-                        _DBG_PARALLEL_DONE = True
-                        _dbg_save(
-                            negative_kwargs, local_pred,
-                            _DBG_PARALLEL_DIR, "parallel",
-                            transformer=getattr(self, "transformer", None),
-                        )
+                    local_pred = self.predict_noise(**negative_kwargs)
 
                 # Slice output for image editing pipelines (remove condition latents)
                 if output_slice is not None:
@@ -163,34 +78,7 @@ class CFGParallelMixin(metaclass=ABCMeta):
             else:
                 # Sequential CFG: compute both positive and negative
                 positive_noise_pred = self.predict_noise(**positive_kwargs)
-                transformer = getattr(self, "transformer", None)
-                if transformer is not None:
-                    transformer._cfg_debug_branch = "original"
-                # ── encoder debug logging ────────────────────────────────────────
-                encoder_hs = negative_kwargs.get("encoder_hidden_states", None)
-                if encoder_hs is not None and isinstance(encoder_hs, torch.Tensor):
-                    print(
-                        f"[cfg-debug:original] encoder_hidden_states input: "
-                        f"shape={encoder_hs.shape}, dtype={encoder_hs.dtype}, device={encoder_hs.device}, "
-                        f"mean={encoder_hs.float().mean().item():.6f}, "
-                        f"std={encoder_hs.float().std().item():.6f}, "
-                        f"abs_mean={encoder_hs.float().abs().mean().item():.6f}, "
-                        f"abs_max={encoder_hs.float().abs().max().item():.6f}",
-                        flush=True
-                    )
-                # ──────────────────────────────────────────────────────────────────
-                try:
-                    negative_noise_pred = self.predict_noise(**negative_kwargs)
-                finally:
-                    if transformer is not None:
-                        transformer._cfg_debug_branch = None
-                if not _DBG_ORIGINAL_DONE:
-                    _DBG_ORIGINAL_DONE = True
-                    _dbg_save(
-                        negative_kwargs, negative_noise_pred,
-                        _DBG_ORIGINAL_DIR, "original",
-                        transformer=getattr(self, "transformer", None),
-                    )
+                negative_noise_pred = self.predict_noise(**negative_kwargs)
 
                 # Slice output for image editing pipelines
                 if output_slice is not None:
