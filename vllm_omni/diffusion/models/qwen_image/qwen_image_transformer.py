@@ -47,6 +47,31 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 logger = init_logger(__name__)
 
 
+def _log_cfg_tensor_stats(branch: str, block_idx: int, label: str, tensor: torch.Tensor) -> None:
+    t32 = tensor.detach().float()
+    abs_mean = t32.abs().mean().item()
+    abs_max = t32.abs().max().item()
+    print(
+        f"[cfg-debug:{branch}] block_{block_idx} {label}: abs_mean={abs_mean}, abs_max={abs_max}",
+        flush=True,
+    )
+
+
+def _log_cfg_step_stats(branch: str, step_idx: int, label: str, tensor: torch.Tensor) -> None:
+    t32 = tensor.detach().float()
+    abs_mean = t32.abs().mean().item()
+    abs_max = t32.abs().max().item()
+    print(
+        f"[cfg-debug:{branch}] step_{step_idx} {label}: abs_mean={abs_mean}, abs_max={abs_max}",
+        flush=True,
+    )
+
+
+if hasattr(torch, "_dynamo"):
+    _log_cfg_tensor_stats = torch._dynamo.disable(_log_cfg_tensor_stats)
+    _log_cfg_step_stats = torch._dynamo.disable(_log_cfg_step_stats)
+
+
 class ImageRopePrepare(nn.Module):
     """Prepares image hidden_states and RoPE embeddings for sequence parallel.
 
@@ -772,6 +797,24 @@ class QwenImageTransformerBlock(nn.Module):
         # Process text stream - norm1 + modulation
         txt_modulated, txt_gate1 = self.txt_norm1(encoder_hidden_states, txt_mod1)
 
+        debug_branch = getattr(self, "_cfg_debug_branch", None)
+        should_log = bool(getattr(self, "_cfg_should_log", False))
+        raw_block_idx = getattr(self, "_cfg_block_idx", None)
+        try:
+            block_idx = int(raw_block_idx) if raw_block_idx is not None else None
+        except (TypeError, ValueError):
+            block_idx = None
+        _detail = should_log and debug_branch in {"parallel", "original"} and block_idx is not None
+
+        if _detail:
+            _log_cfg_tensor_stats(debug_branch, block_idx, "A_input_hs", hidden_states)
+            _log_cfg_tensor_stats(debug_branch, block_idx, "B_input_enc", encoder_hidden_states)
+            _log_cfg_tensor_stats(debug_branch, block_idx, "C_img_mod_params", img_mod_params)
+            _log_cfg_tensor_stats(debug_branch, block_idx, "D_txt_mod_params", txt_mod_params)
+            _log_cfg_tensor_stats(debug_branch, block_idx, "E_img_modulated", img_modulated)
+            _log_cfg_tensor_stats(debug_branch, block_idx, "F_txt_modulated", txt_modulated)
+            _log_cfg_tensor_stats(debug_branch, block_idx, "G_temb", temb)
+
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
         # 1. Computes QKV for both streams
@@ -790,9 +833,17 @@ class QwenImageTransformerBlock(nn.Module):
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
 
+        if _detail:
+            _log_cfg_tensor_stats(debug_branch, block_idx, "H_img_attn_output", img_attn_output)
+            _log_cfg_tensor_stats(debug_branch, block_idx, "I_txt_attn_output", txt_attn_output)
+
         # Apply attention gates and add residual (like in Megatron)
         hidden_states = hidden_states + img_gate1 * img_attn_output
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+
+        if _detail:
+            _log_cfg_tensor_stats(debug_branch, block_idx, "J_hs_after_attn_residual", hidden_states)
+            _log_cfg_tensor_stats(debug_branch, block_idx, "K_enc_after_attn_residual", encoder_hidden_states)
 
         # Process image stream - norm2 + MLP
         img_modulated2, img_gate2 = self.img_norm2(hidden_states, img_mod2, modulate_index)
@@ -800,10 +851,16 @@ class QwenImageTransformerBlock(nn.Module):
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
+        if _detail:
+            _log_cfg_tensor_stats(debug_branch, block_idx, "L_hs_after_mlp", hidden_states)
+
         # Process text stream - norm2 + MLP
         txt_modulated2, txt_gate2 = self.txt_norm2(encoder_hidden_states, txt_mod2)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+
+        if _detail:
+            _log_cfg_tensor_stats(debug_branch, block_idx, "M_enc_after_mlp", encoder_hidden_states)
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -1047,7 +1104,15 @@ class QwenImageTransformer2DModel(CachedTransformer):
         if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.all():
             encoder_hidden_states_mask = None
 
+        debug_branch = getattr(self, "_cfg_debug_branch", None)
+        step_idx = getattr(self, "_cfg_debug_step", 0)
+        is_debug = debug_branch in {"parallel", "original"}
+        is_step0 = is_debug and step_idx == 0
+
         for index_block, block in enumerate(self.transformer_blocks):
+            block._cfg_block_idx = index_block
+            block._cfg_debug_branch = debug_branch
+            block._cfg_should_log = is_step0
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -1058,12 +1123,18 @@ class QwenImageTransformer2DModel(CachedTransformer):
                 modulate_index=modulate_index,
                 hidden_states_mask=hidden_states_mask,
             )
+            # Log each block's output hidden_states at step 0
+            if is_step0:
+                _log_cfg_step_stats(debug_branch, 0, f"block_{index_block}_out_hs", hidden_states)
 
         if self.zero_cond_t:
             temb = temb.chunk(2, dim=0)[0]
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
+
+        if is_debug:
+            self._cfg_debug_step = step_idx + 1
 
         # Note: SP gather is handled automatically by _sp_plan's SequenceParallelGatherHook
         # on proj_out output. No manual all_gather needed here.

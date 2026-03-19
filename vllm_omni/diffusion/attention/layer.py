@@ -7,6 +7,8 @@
 # https://github.com/feifeibear/long-context-attention/blob/main/yunchang/attention/layer.py
 
 
+import os
+
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -56,6 +58,7 @@ class Attention(nn.Module):
             num_kv_heads=num_kv_heads,
         )
         self.backend_pref = None
+        self.deterministic = os.environ.get("DIFFUSION_DETERMINISTIC_ATTENTION", "0") == "1"
 
         self.softmax_scale = softmax_scale
         self.scatter_idx = scatter_idx
@@ -70,6 +73,11 @@ class Attention(nn.Module):
         try:
             config = get_forward_context().omni_diffusion_config
             self.backend_pref = config.attention_backend
+            if not self.deterministic:
+                self.deterministic = getattr(config, 'deterministic_attention', False)
+            if self.deterministic:
+                self.sdpa_fallback.deterministic = True
+                logger.info_once("Deterministic attention enabled: forcing SDPA math kernel")
             if config.parallel_config.ring_degree > 1:
                 self.use_ring = True
                 try:
@@ -137,6 +145,9 @@ class Attention(nn.Module):
                 f"Only SDPA supports float32. Overriding user config {type(self.attention)} "
                 f"attention_backend='{self.backend_pref}' to 'sdpa' for dtype={query.dtype}."
             )
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
+        if self.deterministic:
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
         # Fallback to standard attention

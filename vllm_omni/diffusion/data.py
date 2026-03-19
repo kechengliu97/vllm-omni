@@ -327,6 +327,7 @@ class OmniDiffusionConfig:
 
     # Attention
     attention_backend: str | None = None
+    deterministic_attention: bool = False
 
     # Running mode
     # mode: ExecutionMode = ExecutionMode.INFERENCE

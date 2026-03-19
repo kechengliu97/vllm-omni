@@ -60,7 +60,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
                 if cfg_rank == 0:
                     local_pred = self.predict_noise(**positive_kwargs)
                 else:
-                    local_pred = self.predict_noise(**negative_kwargs)
+                    transformer = getattr(self, "transformer", None)
+                    if transformer is not None:
+                        transformer._cfg_debug_branch = "parallel"
+                    try:
+                        local_pred = self.predict_noise(**negative_kwargs)
+                    finally:
+                        if transformer is not None:
+                            transformer._cfg_debug_branch = None
 
                 # Slice output for image editing pipelines (remove condition latents)
                 if output_slice is not None:
@@ -78,7 +85,14 @@ class CFGParallelMixin(metaclass=ABCMeta):
             else:
                 # Sequential CFG: compute both positive and negative
                 positive_noise_pred = self.predict_noise(**positive_kwargs)
-                negative_noise_pred = self.predict_noise(**negative_kwargs)
+                transformer = getattr(self, "transformer", None)
+                if transformer is not None:
+                    transformer._cfg_debug_branch = "original"
+                try:
+                    negative_noise_pred = self.predict_noise(**negative_kwargs)
+                finally:
+                    if transformer is not None:
+                        transformer._cfg_debug_branch = None
 
                 # Slice output for image editing pipelines
                 if output_slice is not None:

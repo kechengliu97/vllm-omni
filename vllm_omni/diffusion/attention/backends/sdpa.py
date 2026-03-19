@@ -88,6 +88,7 @@ class SDPAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
+        self.deterministic = False
 
     def _forward_impl(
         self,
@@ -104,15 +105,34 @@ class SDPAImpl(AttentionImpl):
             attention_mask = _maybe_reshape_attn_mask(query, key, attn_metadata.attn_mask, mask_mode=mask_mode)
 
         query, key, value = (x.permute(0, 2, 1, 3) for x in (query, key, value))
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=self.causal,
-            scale=self.softmax_scale,
-        )
+        if self.deterministic:
+            # Upcast to FP32 to ensure cross-GPU bit-identical GEMM results,
+            # then compute with MATH kernel (standard matmul, no flash/efficient).
+            orig_dtype = query.dtype
+            query, key, value = query.float(), key.float(), value.float()
+            if attention_mask is not None:
+                attention_mask = attention_mask.float()
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                output = torch.nn.functional.scaled_dot_product_attention(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=self.causal,
+                    scale=self.softmax_scale,
+                )
+            output = output.to(orig_dtype)
+        else:
+            output = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=self.causal,
+                scale=self.softmax_scale,
+            )
         out = output.permute(0, 2, 1, 3)
         return out
 
