@@ -83,8 +83,6 @@ def test_feature(omni_server: OmniServer, openai_client: OpenAIClientHandler):
             "true_cfg_scale": 4.0,
             "seed": 42,
             "num_outputs_per_prompt": 4,
-            "width": 640,
-            "height": 640,
         },
     }
 
@@ -239,8 +237,6 @@ def test_empty_prompt(omni_server: OmniServer, openai_client: OpenAIClientHandle
             "true_cfg_scale": 4.0,
             "seed": 42,
             "num_outputs_per_prompt": 4,
-            "width": 640,
-            "height": 640,
         },
     }
 
