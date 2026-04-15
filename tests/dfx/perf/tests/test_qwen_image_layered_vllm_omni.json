@@ -23,8 +23,8 @@
                 "baseline": {
                     "throughput_qps": 0.02,
                     "latency_mean": 40.0,
-                    "peak_memory_mb_max": 82000,
-                    "peak_memory_mb_mean": 82000
+                    "peak_memory_mb_max": 70000,
+                    "peak_memory_mb_mean": 70000
                 }
             },
             {
@@ -39,9 +39,9 @@
                 "enable-negative-prompt": true,
                 "baseline": {
                     "throughput_qps": 0.005,
-                    "latency_mean": 150.0,
-                    "peak_memory_mb_max": 90000,
-                    "peak_memory_mb_mean": 90000
+                    "latency_mean": 80.0,
+                    "peak_memory_mb_max": 70000,
+                    "peak_memory_mb_mean": 70000
                 }
             }
         ]
