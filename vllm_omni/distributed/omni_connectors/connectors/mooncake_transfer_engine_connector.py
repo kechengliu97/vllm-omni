@@ -792,11 +792,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         if not metadata:
             # Path 3: no metadata at all — query default sender
             if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
-                raise RuntimeError(
-                    f"get(metadata=None) requires sender info to be resolved, "
-                    f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
-                    f"Call update_sender_info(host, port) before using get() without metadata."
+                logger.debug(
+                    "get(%s): sender info not yet resolved (sender_host=%r, sender_zmq_port=%r). "
+                    "Returning None — caller should retry after update_sender_info().",
+                    get_key,
+                    self.sender_host,
+                    self.sender_zmq_port,
                 )
+                return None
             metadata = self._query_metadata_from_sender(get_key)
             if not metadata:
                 return None

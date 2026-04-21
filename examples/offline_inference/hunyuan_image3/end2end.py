@@ -48,7 +48,10 @@ def build_prompt(
     sys_type: str | None = None,
     custom_system_prompt: str | None = None,
 ) -> str:
-    """Build a HunyuanImage-3.0 prompt using pretrain template format."""
+    """Build a HunyuanImage-3.0 prompt using the instruct conversation template.
+
+    Format: <|startoftext|>{sys}\\n\\nUser: [<img>]{user_prompt}\\n\\nAssistant: [trigger_tag]
+    """
     if task not in _TASK_PRESETS:
         raise ValueError(f"Unknown task {task!r}. Choose from: {sorted(_TASK_PRESETS)}")
 
@@ -63,11 +66,13 @@ def build_prompt(
     parts = ["<|startoftext|>"]
     if sys_text:
         parts.append(sys_text)
+    parts.append("\n\nUser: ")
     if has_image_input:
         parts.append("<img>")
+    parts.append(user_prompt)
+    parts.append("\n\nAssistant: ")
     if trigger_tag:
         parts.append(trigger_tag)
-    parts.append(user_prompt)
 
     return "".join(parts)
 
@@ -180,8 +185,14 @@ def main():
     formatted_prompts: list[OmniPromptType] = []
     for p in prompts:
         formatted_text = build_prompt(p, task=task, sys_type=args.sys_type)
+        preset_sys_type, _, _ = _TASK_PRESETS[task]
+        effective_sys_type = args.sys_type or preset_sys_type
 
-        prompt_dict: dict = {"prompt": formatted_text}
+        prompt_dict: dict = {
+            "prompt": formatted_text,
+            "user_prompt": p,
+            "use_system_prompt": effective_sys_type,
+        }
 
         if args.modality == "text2img":
             prompt_dict["modalities"] = ["image"]

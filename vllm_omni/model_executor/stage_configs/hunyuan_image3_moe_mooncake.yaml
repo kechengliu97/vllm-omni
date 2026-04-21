@@ -1,33 +1,31 @@
-# Stage config for running Hunyuan-Image3.0 with AR→DiT KV reuse.
+# Stage config for running Hunyuan-Image3.0 with AR→DiT KV reuse via D2D RDMA.
 # Stage 0: AR Model (vLLM implementation)
 # Stage 1: DiT Model (diffusion)
 #
-# text-to-image flow: AR (stage 0) → KV transfer → DiT (stage 1)
-# image-to-text flow: AR (stage 0) only
+# text-to-image flow: AR (stage 0) → D2D RDMA KV transfer → DiT (stage 1)
 #
-# Compared to hunyuan_image3_t2i.yaml, this config:
-#   1. Enables both stages [0, 1] for text-to-image (AR prefill + DiT denoising)
-#   2. Adds omni_kv_config to send/receive KV cache between stages
-#   3. Uses prompt_expand_func for CFG companion AR requests
-#   4. Removes kv_transfer_criteria so AR decodes until EOS, then transfers
-#      full KV cache (including think + recaption tokens) to DiT.
-
+# Uses MooncakeTransferEngineConnector in P2P handshake mode — no intermediate
+# metadata server required, just direct device-to-device RDMA transfer.
+#
+# Optional env: RDMA_DEVICE_NAME (e.g. "mlx5_0") to pin a specific NIC.
+#
 # The following config has been verified on 8x L40S-48G GPU (4 for AR + 4 for DiT).
+
 stage_args:
   - stage_id: 0
-    stage_type: llm  # Use llm stage type for AR stages
+    stage_type: llm
     prompt_expand_func: vllm_omni.model_executor.stage_input_processors.hunyuan_image3.expand_cfg_prompts
     runtime:
-      process: true  # Run this stage in a separate process
-      devices: "0,1,2,3"  # AR stage uses GPU 0-3
+      process: true
+      devices: "0,1,2,3"
     engine_args:
       model_stage: AR
-      max_num_seqs: 2  # main request + CFG companion
+      max_num_seqs: 2
       model_arch: HunyuanImage3ForCausalMM
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       gpu_memory_utilization: 0.9
-      enforce_eager: true  # Now we only support eager mode
+      enforce_eager: true
       trust_remote_code: true
       engine_output_type: latent
       enable_prefix_caching: false
@@ -40,8 +38,6 @@ stage_args:
           rope_type: default
       omni_kv_config:
         need_send_cache: true
-        # No kv_transfer_criteria: AR decodes until EOS, then transfers full
-        # KV cache (including think + recaption tokens) via _free_request path.
     is_comprehension: true
     final_output: true
     final_output_type: text
@@ -51,14 +47,17 @@ stage_args:
       top_k: -1
       max_tokens: 2048
       seed: 42
-      detokenize: True
+      detokenize: true
       repetition_penalty: 1.1
+    output_connectors:
+      to_stage_1: rdma_connector
+
   - stage_id: 1
     stage_type: diffusion
     cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.hunyuan_image3.collect_cfg_kv_caches
     runtime:
       process: true
-      devices: "4,5,6,7"  # DiT stage uses GPU 4-7
+      devices: "4,5,6,7"
       max_batch_size: 1
     engine_args:
       model_stage: diffusion
@@ -70,7 +69,7 @@ stage_args:
       cache_config: null
       enable_cache_dit_summary: false
       omni_kv_config:
-        need_recv_cache: true  # Receive AR KV cache from stage 0
+        need_recv_cache: true
       parallel_config:
         pipeline_parallel_size: 1
         data_parallel_size: 1
@@ -84,16 +83,29 @@ stage_args:
         use_hsdp: false
         hsdp_shard_size: -1
         hsdp_replicate_size: 1
-    engine_input_source: [0]  # Receive input (including KV) from stage 0
+    engine_input_source: [0]
     final_output: true
     final_output_type: image
+    input_connectors:
+      from_stage_0: rdma_connector
 
-# Top-level runtime config: windows, edges, and connectors
+# Top-level runtime config with D2D RDMA connector
 runtime:
   enabled: true
   defaults:
-    window_size: -1  # Trigger downstream only after full upstream completion
-    max_inflight: 1  # Process serially within each stage
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    rdma_connector:
+      name: MooncakeTransferEngineConnector
+      extra:
+        host: "auto"               # auto-detect local IP for RDMA
+        zmq_port: 50051             # ZMQ handshake port
+        protocol: "rdma"            # "rdma" for RDMA NIC, "tcp" for fallback
+        device_name: ""             # e.g. "mlx5_0" to pin NIC, or "" for auto
+        memory_pool_size: 4294967296  # 4 GB registered memory pool
+        memory_pool_device: "cpu"   # "cpu" (pinned) or "cuda" (GPUDirect RDMA)
 
   edges:
     - from: 0
