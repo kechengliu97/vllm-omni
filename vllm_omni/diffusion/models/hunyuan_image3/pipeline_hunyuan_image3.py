@@ -1466,9 +1466,13 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         )
         attention_mask[:, :, :, -1] = False  # don't attend to dummy eoi
 
+        # Mask zero-padded DiT-specific special tokens for both branches.
+        # inject_prompt_kv_cache fills positions [L_text : L_text+NUM_SPECIAL_TOKENS]
+        # with zeros; without this mask the image queries waste attention weight on
+        # zero KV vectors, producing different softmax normalisation than the normal path.
+        attention_mask[:, :, :, L_text : L_text + NUM_SPECIAL_TOKENS] = False
+
         # For CFG: mask out padded text positions in the negative branch.
-        # The special tokens (L_text..L_text+NUM_SPECIAL_TOKENS) are zero-padded
-        # in inject_prompt_kv_cache and already masked out for both branches.
         if use_cfg and L_neg < L_text:
             attention_mask[1, :, :, L_neg:L_text] = False
 
