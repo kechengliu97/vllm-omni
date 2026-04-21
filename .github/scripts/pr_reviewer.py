@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PR Reviewer using GLM API for vllm-omni project.
+PR Reviewer using Claude API (Anthropic) for vllm-omni project.
 """
 
 import json
@@ -14,10 +14,7 @@ from typing import Any, TypedDict
 import requests
 
 
-# Type definitions for API responses
 class PRDetails(TypedDict):
-    """Type definition for GitHub PR details response."""
-
     title: str
     body: str
     number: int
@@ -25,59 +22,30 @@ class PRDetails(TypedDict):
     user: dict[str, Any]
 
 
-class GLMMessage(TypedDict):
-    """Type definition for GLM API message."""
-
-    role: str
-    content: str
-
-
-class GLMChoice(TypedDict):
-    """Type definition for GLM API choice."""
-
-    message: GLMMessage
-    finish_reason: str
-
-
-class GLMResponse(TypedDict):
-    """Type definition for GLM API response."""
-
-    choices: list[GLMChoice]
-    usage: dict[str, int] | None
-
-
 class GitHubComment(TypedDict):
-    """Type definition for GitHub comment."""
-
     id: int
     body: str
     created_at: str
     user: dict[str, Any]
 
 
-# Configuration
 TRIGGER_PHRASE: str = "@vllm-omni-reviewer"
-DEFAULT_GLM_API_URL: str = "https://open.bigmodel.cn/api/paas/v4/chat/completions"  # noqa: E501
-DEFAULT_GLM_MODEL: str = "glm-5"
+DEFAULT_CLAUDE_MODEL: str = "claude-sonnet-4-6"
 DEFAULT_COOLDOWN_MINUTES: int = 5
 DEFAULT_MAX_RETRIES: int = 3
 DEFAULT_RETRY_DELAY: float = 1.0
-MAX_DIFF_SIZE: int = 100_000  # Maximum diff size in characters
+MAX_DIFF_SIZE: int = 100_000
 
 
 @dataclass
 class Config:
-    """Configuration for the PR reviewer."""
-
-    glm_api_url: str
-    glm_model: str
+    claude_model: str
     cooldown_minutes: int
     max_retries: int
     retry_delay: float
     max_diff_size: int
 
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format="[PR Reviewer] %(asctime)s - %(levelname)s - %(message)s",
@@ -87,40 +55,16 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def get_config() -> Config:
-    """Load configuration from environment variables with defaults."""
     return Config(
-        glm_api_url=os.getenv("GLM_API_URL", DEFAULT_GLM_API_URL),
-        glm_model=os.getenv("GLM_MODEL", DEFAULT_GLM_MODEL),
-        cooldown_minutes=int(
-            os.getenv(
-                "PR_REVIEWER_COOLDOWN_MINUTES",
-                str(DEFAULT_COOLDOWN_MINUTES),
-            )
-        ),
-        max_retries=int(
-            os.getenv(
-                "PR_REVIEWER_MAX_RETRIES",
-                str(DEFAULT_MAX_RETRIES),
-            )
-        ),
+        claude_model=os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL),
+        cooldown_minutes=int(os.getenv("PR_REVIEWER_COOLDOWN_MINUTES", str(DEFAULT_COOLDOWN_MINUTES))),
+        max_retries=int(os.getenv("PR_REVIEWER_MAX_RETRIES", str(DEFAULT_MAX_RETRIES))),
         retry_delay=float(os.getenv("PR_REVIEWER_RETRY_DELAY", str(DEFAULT_RETRY_DELAY))),
-        max_diff_size=int(os.getenv("PR_REVIEWER_MAX_DIFF_SIZE", str(MAX_DIFF_SIZE))),  # noqa: E501
+        max_diff_size=int(os.getenv("PR_REVIEWER_MAX_DIFF_SIZE", str(MAX_DIFF_SIZE))),
     )
 
 
 def get_env_var(name: str) -> str:
-    """
-    Get an environment variable or raise an error.
-
-    Args:
-        name: Name of the environment variable.
-
-    Returns:
-        The value of the environment variable.
-
-    Raises:
-        SystemExit: If the environment variable is not set.
-    """
     value = os.environ.get(name)
     if not value:
         logger.error(f"Environment variable {name} is not set")
@@ -129,108 +73,70 @@ def get_env_var(name: str) -> str:
 
 
 def check_trigger(comment_body: str) -> bool:
-    """
-    Check if the comment contains the trigger phrase.
-
-    Args:
-        comment_body: The body of the comment to check.
-
-    Returns:
-        True if the trigger phrase is found, False otherwise.
-    """
     return TRIGGER_PHRASE in comment_body
 
 
-def fetch_pr_diff(
-    repo_name: str,
-    pr_number: int,
-    token: str,
-    max_size: int = MAX_DIFF_SIZE,
-) -> str | None:
-    """
-    Fetch the diff for a pull request.
-
-    Args:
-        repo_name: The repository name in format "owner/repo".
-        pr_number: The pull request number.
-        token: GitHub authentication token.
-        max_size: Maximum diff size in characters.
-
-    Returns:
-        The diff content as a string, or None if fetching failed.
-        Returns empty string if diff is larger than max_size.
-    """
-    url: str = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
-    headers: dict[str, str] = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3.diff",
-    }
-
+def fetch_pr_diff(repo_name: str, pr_number: int, token: str, max_size: int = MAX_DIFF_SIZE) -> str | None:
+    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3.diff"}
     logger.info(f"Fetching PR diff from {url}")
     response = requests.get(url, headers=headers, timeout=30)
-
     if response.status_code == 200:
-        diff: str = response.text
+        diff = response.text
         if len(diff) > max_size:
-            logger.warning(
-                f"Diff size ({len(diff)} bytes) exceeds maximum "
-                f"({max_size} bytes), truncating to first "
-                f"{max_size} bytes"
-            )
+            logger.warning(f"Diff size ({len(diff)} bytes) exceeds maximum ({max_size} bytes), truncating")
             return diff[:max_size] + "\n\n... [Diff truncated due to size] ..."
         logger.info(f"Successfully fetched diff ({len(diff)} bytes)")
         return diff
-    else:
-        logger.error(f"Failed to fetch PR diff: {response.status_code}")
-        logger.error(f"Response: {response.text}")
-        return None
+    logger.error(f"Failed to fetch PR diff: {response.status_code}\n{response.text}")
+    return None
 
 
-def fetch_pr_details(
-    repo_name: str,
-    pr_number: int,
-    token: str,
-) -> PRDetails | None:
-    """
-    Fetch PR details including title and description.
-
-    Args:
-        repo_name: The repository name in format "owner/repo".
-        pr_number: The pull request number.
-        token: GitHub authentication token.
-
-    Returns:
-        A dictionary containing PR details, or None if fetching failed.
-    """
-    url: str = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
-    headers: dict[str, str] = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
+def fetch_pr_details(repo_name: str, pr_number: int, token: str) -> PRDetails | None:
+    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     logger.info(f"Fetching PR details from {url}")
     response = requests.get(url, headers=headers, timeout=30)
-
     if response.status_code == 200:
         return response.json()
-    else:
-        logger.error(f"Failed to fetch PR details: {response.status_code}")
-        return None
+    logger.error(f"Failed to fetch PR details: {response.status_code}")
+    return None
 
 
-def build_review_prompt(pr_title: str, pr_description: str, diff: str) -> str:
-    """
-    Build the prompt for the GLM-4.7 API.
+def fetch_pr_review_comments(repo_name: str, pr_number: int, token: str) -> list[dict[str, Any]]:
+    url = f"https://api.github.com/repos/{repo_name}/pulls/{pr_number}/comments"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+    response = requests.get(url, headers=headers, timeout=30)
+    if response.status_code == 200:
+        return response.json()
+    logger.warning(f"Failed to fetch review comments: {response.status_code}")
+    return []
 
-    Args:
-        pr_title: The title of the pull request.
-        pr_description: The description/body of the pull request.
-        diff: The diff content of the pull request.
 
-    Returns:
-        The formatted prompt string for the API.
-    """
-    return f"""You are an expert code reviewer for the VLLM-Omni project. \
+def build_review_prompt(
+    pr_title: str,
+    pr_description: str,
+    diff: str,
+    review_comments: list[dict[str, Any]],
+) -> str:
+    comments_section = ""
+    if review_comments:
+        comments_text = "\n".join(
+            f"- [{c['path']}:{c.get('line', '?')}] {c['user']['login']}: {c['body']}"
+            for c in review_comments
+        )
+        comments_section = f"""
+## Existing Review Comments
+The following inline review comments have already been posted on this PR.
+Please address each one specifically in your response:
+
+{comments_text}
+"""
+
+    return f"""You are an expert code reviewer for the vLLM-Omni project — a multi-stage \
+heterogeneous inference framework built on vLLM that supports AR (autoregressive) and \
+Diffusion (DiT) stages, inter-stage KV cache transfer, and omni-modal generation.
+
 Please review the following pull request:
 
 ## Pull Request Details
@@ -238,7 +144,7 @@ Please review the following pull request:
 
 **Description:**
 {pr_description if pr_description else "No description provided."}
-
+{comments_section}
 ## Code Changes (Diff)
 {diff}
 
@@ -251,373 +157,195 @@ Please provide a comprehensive code review with the following sections:
 - Overall assessment (positive, neutral, or concerns)
 
 ### 2. Code Quality
-- Code style and consistency
+- Code style and consistency with the existing codebase
 - Potential bugs or edge cases
 - Performance considerations
 - Error handling
 
 ### 3. Architecture & Design
-- Integration with existing codebase
+- Integration with the multi-stage pipeline (AR stage, DiT stage, orchestrator)
+- Correctness of KV cache layout and inter-stage transfers (if applicable)
 - Design patterns and best practices
-- Potential improvements
 
-### 4. Security & Safety
-- Security concerns (if any)
-- Resource management
-- Input validation
+### 4. Response to Existing Review Comments
+- If there are existing review comments above, address each one explicitly.
+- State whether each concern is valid, already fixed, or not applicable.
 
-### 5. Testing & Documentation
-- Test coverage considerations
-- Documentation completeness
-- Examples and usage clarity
+### 5. Specific Suggestions
+- Concrete actionable feedback using `file:line` format
+- Code examples for improvements where helpful
 
-### 6. Specific Suggestions
-- Line-by-line specific feedback (use `file:line` format)
-- Concrete actionable suggestions
-- Code examples for improvements (if applicable)
-
-### 7. Approval Status
-- **LGTM** (Looks Good To Me) if the PR is ready to merge
-- **LGTM with suggestions** if the PR is good but has minor suggestions
+### 6. Approval Status
+- **LGTM** if the PR is ready to merge
+- **LGTM with suggestions** if good but has minor suggestions
 - **Changes requested** if significant changes are needed
 
-## Important Notes
-- Be constructive and helpful
-- Focus on objective technical feedback
-- Acknowledge good practices when you see them
-- Prioritize critical issues over nitpicks
-- If the diff is empty or minimal, acknowledge this and provide
-  any relevant context-specific guidance
-
-Please format your response in Markdown with clear section headers.
+Be constructive, focus on objective technical feedback, and acknowledge good practices.
+Format your response in Markdown with clear section headers.
 """
 
 
-def validate_glm_response(data: dict[str, Any]) -> str | None:
-    """
-    Validate and extract content from GLM API response.
-
-    Args:
-        data: The response data from GLM API.
-
-    Returns:
-        The review content string if valid, None otherwise.
-    """
-    # Check if choices exists and is a non-empty list
-    if "choices" not in data:
-        logger.error("GLM API response missing 'choices' field")
-        logger.error(f"Response structure: {json.dumps(data, indent=2)}")
-        return None
-
-    choices = data["choices"]
-    if not isinstance(choices, list):
-        logger.error(f"GLM API 'choices' is not a list: {type(choices)}")
-        return None
-
-    if len(choices) == 0:
-        logger.error("GLM API 'choices' is an empty list")
-        return None
-
-    # Check if first choice has message
-    try:
-        first_choice = choices[0]
-        if not isinstance(first_choice, dict):
-            logger.error(f"GLM API choice is not a dict: {type(first_choice)}")
-            return None
-
-        if "message" not in first_choice:
-            logger.error("GLM API choice missing 'message' field")
-            logger.error(f"Choice structure: {json.dumps(first_choice, indent=2)}")  # noqa: E501
-            return None
-
-        message = first_choice["message"]
-        if not isinstance(message, dict):
-            logger.error(f"GLM API message is not a dict: {type(message)}")
-            return None
-
-        if "content" not in message:
-            logger.error("GLM API message missing 'content' field")
-            logger.error(f"Message structure: {json.dumps(message, indent=2)}")
-            return None
-
-        content = message["content"]
-        if not isinstance(content, str):
-            logger.error(f"GLM API content is not a string: {type(content)}")
-            return None
-
-        return content
-
-    except (KeyError, IndexError, TypeError) as e:
-        logger.error(f"Failed to parse GLM API response: {e}")
-        logger.error(f"Response: {json.dumps(data, indent=2)}")
-        return None
-
-
-def call_glm_api(prompt: str, api_key: str, config: Config) -> str | None:
-    """
-    Call the GLM-4.7 API to get code review with retry logic.
-
-    Args:
-        prompt: The prompt to send to the API.
-        api_key: The GLM API key.
-        config: Configuration object.
-
-    Returns:
-        The review content as a string, or None if all retries failed.
-    """
-    headers: dict[str, str] = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+def call_claude_api(prompt: str, api_key: str, config: Config) -> str | None:
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
     }
-
     payload: dict[str, Any] = {
-        "model": config.glm_model,
+        "model": config.claude_model,
+        "max_tokens": 8192,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.3,
-        "max_tokens": 32000,
-        "top_p": 0.9,
     }
-
     last_error: str | None = None
 
     for attempt in range(config.max_retries):
         try:
-            logger.info(f"Calling GLM API ({config.glm_model}) - Attempt {attempt + 1}/{config.max_retries}")
+            logger.info(f"Calling Claude API ({config.claude_model}) - Attempt {attempt + 1}/{config.max_retries}")
             response = requests.post(
-                config.glm_api_url,
+                "https://api.anthropic.com/v1/messages",
                 headers=headers,
                 json=payload,
                 timeout=120,
             )
-
             if response.status_code == 200:
                 data = response.json()
-                review = validate_glm_response(data)
-                if review:
-                    logger.info(f"Successfully received review ({len(review)} chars)")  # noqa: E501
+                text_blocks = [b["text"] for b in data.get("content", []) if b.get("type") == "text"]
+                if text_blocks:
+                    review = "\n".join(text_blocks)
+                    logger.info(f"Successfully received review ({len(review)} chars)")
                     return review
-                else:
-                    last_error = "Failed to validate API response structure"
-                    logger.error(last_error)
+                last_error = "Claude API returned no text content"
+                logger.error(f"{last_error}: {json.dumps(data, indent=2)}")
             else:
-                last_error = f"GLM API request failed: {response.status_code} - {response.text}"
+                last_error = f"Claude API request failed: {response.status_code} - {response.text}"
                 logger.error(last_error)
-
         except requests.exceptions.Timeout:
-            last_error = f"GLM API request timed out (attempt {attempt + 1})"
+            last_error = f"Claude API request timed out (attempt {attempt + 1})"
             logger.error(last_error)
         except requests.exceptions.RequestException as e:
-            last_error = f"GLM API request exception: {e}"
+            last_error = f"Claude API request exception: {e}"
             logger.error(last_error)
-        except json.JSONDecodeError as e:
-            last_error = f"Failed to decode GLM API response as JSON: {e}"
+        except (json.JSONDecodeError, KeyError) as e:
+            last_error = f"Failed to parse Claude API response: {e}"
             logger.error(last_error)
 
-        # Exponential backoff before retry
         if attempt < config.max_retries - 1:
-            wait_time: float = config.retry_delay * (2**attempt)
-            logger.info(f"Waiting {wait_time}s before retry...")  # noqa: E501
+            wait_time = config.retry_delay * (2**attempt)
+            logger.info(f"Waiting {wait_time}s before retry...")
             time.sleep(wait_time)
 
-    logger.error(
-        f"All {config.max_retries} attempts failed. Last error: {last_error}"  # noqa: E501
-    )
+    logger.error(f"All {config.max_retries} attempts failed. Last error: {last_error}")
     return None
 
 
-def check_cooldown(  # noqa: E501
-    repo_name: str,
-    pr_number: int,
-    token: str,
-    cooldown_minutes: int,
-) -> bool:
-    """
-    Check if the PR is within the cooldown period.
-
-    Args:
-        repo_name: The repository name in format "owner/repo".
-        pr_number: The pull request number.
-        token: GitHub authentication token.
-        cooldown_minutes: Cooldown period in minutes.
-
-    Returns:
-        True if within cooldown period (should skip), False otherwise.
-    """
+def check_cooldown(repo_name: str, pr_number: int, token: str, cooldown_minutes: int) -> bool:
     from datetime import datetime, timedelta
 
-    url: str = (
-        f"https://api.github.com/repos/{repo_name}/issues/"
-        f"{pr_number}/comments"  # noqa: E501
-    )
-    headers: dict[str, str] = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
+    url = f"https://api.github.com/repos/{repo_name}/issues/{pr_number}/comments"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
     logger.info(f"Checking cooldown period ({cooldown_minutes} minutes)")
     response = requests.get(url, headers=headers, timeout=30)
-
     if response.status_code != 200:
         logger.warning(f"Failed to check cooldown: {response.status_code}, proceeding with review")
         return False
 
     comments: list[dict[str, Any]] = response.json()
-    cutoff_time: datetime = datetime.utcnow() - timedelta(minutes=cooldown_minutes)  # noqa: E501
+    cutoff_time = datetime.utcnow() - timedelta(minutes=cooldown_minutes)
 
     for comment in reversed(comments):
-        # Check if this is a bot comment
-        body: str = comment.get("body", "")
+        body = comment.get("body", "")
         if "VLLM-Omni PR Review" in body or "PR Reviewer Bot" in body:
-            created_at_str: str = comment.get("created_at", "")
+            created_at_str = comment.get("created_at", "")
             try:
-                # Parse GitHub timestamp format
                 created_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
                 created_at = created_at.replace(tzinfo=None)
                 if created_at > cutoff_time:
                     logger.info(f"PR is within cooldown period (last review: {created_at_str})")
                     return True
             except ValueError:
-                logger.warning(f"Failed to parse comment timestamp: {created_at_str}")  # noqa: E501
+                logger.warning(f"Failed to parse comment timestamp: {created_at_str}")
                 continue
 
     logger.info("PR is outside cooldown period, proceeding with review")
     return False
 
 
-def post_review_comment(  # noqa: E501
-    repo_name: str,
-    pr_number: int,
-    token: str,
-    review: str,
-) -> bool:
-    """
-    Post the review as a comment on the PR.
-
-    Args:
-        repo_name: The repository name in format "owner/repo".
-        pr_number: The pull request number.
-        token: GitHub authentication token.
-        review: The review content to post.
-
-    Returns:
-        True if posting succeeded, False otherwise.
-    """
-    url: str = (
-        f"https://api.github.com/repos/{repo_name}/issues/"
-        f"{pr_number}/comments"  # noqa: E501
-    )
-    headers: dict[str, str] = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
-    # Format the review comment
-    comment_body: str = f"""## 🤖 VLLM-Omni PR Review
+def post_review_comment(repo_name: str, pr_number: int, token: str, review: str, model: str) -> bool:
+    url = f"https://api.github.com/repos/{repo_name}/issues/{pr_number}/comments"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
+    comment_body = f"""## 🤖 VLLM-Omni PR Review
 
 {review}
 
 ---
-*This review was generated automatically by the VLLM-Omni PR Reviewer Bot
-using {os.getenv("GLM_MODEL", DEFAULT_GLM_MODEL)}.*
+*This review was generated automatically by the VLLM-Omni PR Reviewer Bot using {model}.*
 """
-
-    payload: dict[str, str] = {"body": comment_body}
-
     logger.info(f"Posting review comment to PR #{pr_number}")
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-
+    response = requests.post(url, headers=headers, json={"body": comment_body}, timeout=30)
     if response.status_code == 201:
         logger.info("Successfully posted review comment")
         return True
-    else:
-        logger.error(f"Failed to post comment: {response.status_code}")
-        logger.error(f"Response: {response.text}")
-        return False
+    logger.error(f"Failed to post comment: {response.status_code}\n{response.text}")
+    return False
 
 
 def main() -> int:
-    """
-    Main entry point for the PR reviewer bot.
-
-    Returns:
-        0 on success, 1 on error.
-    """
     logger.info("VLLM-Omni PR Reviewer Bot starting...")
+    config = get_config()
+    logger.info(f"Configuration: model={config.claude_model}, cooldown={config.cooldown_minutes}min")
 
-    # Load configuration
-    config: Config = get_config()
-    logger.info(
-        f"Configuration: model={config.glm_model}, "
-        f"cooldown={config.cooldown_minutes}min, "
-        f"max_retries={config.max_retries}"
-    )
-
-    # Get environment variables
-    token: str = get_env_var("GITHUB_TOKEN")
-    api_key: str = get_env_var("GLM_API_KEY")
-    repo_name: str = get_env_var("REPO_NAME")
-    pr_number_str: str = get_env_var("PR_NUMBER")
-    comment_body: str = get_env_var("COMMENT_BODY")
+    token = get_env_var("GITHUB_TOKEN")
+    api_key = get_env_var("ANTHROPIC_API_KEY")
+    repo_name = get_env_var("REPO_NAME")
+    pr_number_str = get_env_var("PR_NUMBER")
+    comment_body = get_env_var("COMMENT_BODY")
 
     try:
-        pr_number: int = int(pr_number_str)
+        pr_number = int(pr_number_str)
     except ValueError:
         logger.error(f"Invalid PR number: {pr_number_str}")
         return 1
 
-    logger.info(f"Repository: {repo_name}")
-    logger.info(f"PR Number: {pr_number}")
+    logger.info(f"Repository: {repo_name}, PR: #{pr_number}")
 
-    # Check if the comment contains the trigger phrase
     if not check_trigger(comment_body):
-        logger.info(
-            f"Comment does not contain trigger phrase '{TRIGGER_PHRASE}', exiting"  # noqa: E501
-        )
+        logger.info(f"Comment does not contain trigger phrase '{TRIGGER_PHRASE}', exiting")
         return 0
 
     logger.info("Trigger phrase detected! Starting review process...")
 
-    # Check cooldown period
     if check_cooldown(repo_name, pr_number, token, config.cooldown_minutes):
         logger.info("Skipping review due to cooldown period")
         return 0
 
-    # Fetch PR details
     logger.info("Step 1/4: Fetching PR details...")
-    pr_details: PRDetails | None = fetch_pr_details(repo_name, pr_number, token)  # noqa: E501
+    pr_details = fetch_pr_details(repo_name, pr_number, token)
     if not pr_details:
         logger.error("Failed to fetch PR details")
         return 1
-
-    pr_title: str = pr_details.get("title", "Unknown")
-    pr_description: str = pr_details.get("body", "")
-
+    pr_title = pr_details.get("title", "Unknown")
+    pr_description = pr_details.get("body", "") or ""
     logger.info(f"PR Title: {pr_title}")
 
-    # Fetch PR diff
-    logger.info("Step 2/4: Fetching PR diff...")
-    diff: str | None = fetch_pr_diff(repo_name, pr_number, token, config.max_diff_size)
+    logger.info("Step 2/4: Fetching PR diff and review comments...")
+    diff = fetch_pr_diff(repo_name, pr_number, token, config.max_diff_size)
     if diff is None:
         logger.error("Failed to fetch PR diff")
         return 1
+    review_comments = fetch_pr_review_comments(repo_name, pr_number, token)
+    logger.info(f"Found {len(review_comments)} existing review comments")
 
-    if not diff:
-        logger.warning("Warning: Empty diff - this might be a draft PR or no code changes")
-
-    # Build prompt
     logger.info("Step 3/4: Building review prompt...")
-    prompt: str = build_review_prompt(pr_title, pr_description, diff)
+    prompt = build_review_prompt(pr_title, pr_description, diff, review_comments)
 
-    # Call GLM API
-    logger.info("Step 4/4: Calling GLM API...")
-    review: str | None = call_glm_api(prompt, api_key, config)
+    logger.info("Step 4/4: Calling Claude API...")
+    review = call_claude_api(prompt, api_key, config)
     if not review:
-        logger.error("Failed to get review from GLM API")
+        logger.error("Failed to get review from Claude API")
         return 1
 
-    # Post review comment
     logger.info("Posting review comment...")
-    if not post_review_comment(repo_name, pr_number, token, review):
+    if not post_review_comment(repo_name, pr_number, token, review, config.claude_model):
         logger.error("Failed to post review comment")
         return 1
 
