@@ -915,6 +915,33 @@ class ImageKVCacheManager:
         cached_prompt_len = cached_key.shape[0] // bs - 1
         assert (cached_prompt_len + 1) == (seq_len - q_len), f"{cached_prompt_len + 1} != {seq_len - q_len}"
 
+        # ── Probe-4: cached_key layout check (runs only on first call) ───────────
+        if not getattr(self, "_probe4_done", False):
+            self._probe4_done = True
+            _ck_f = cached_key.float()
+            _total_cached = cached_key.shape[0]
+            print(f"\n{'='*60}")
+            print(f"[DIAG Probe-4] cached_key.shape={tuple(cached_key.shape)}, bs={bs}, "
+                  f"cached_prompt_len={cached_prompt_len}")
+            _pk_pos = _ck_f[:cached_prompt_len]
+            _pk_eoi = _ck_f[cached_prompt_len : cached_prompt_len + 1]
+            _pk_pos_max = _pk_pos.abs().max().item()
+            _pk_eoi_max = _pk_eoi.abs().max().item()
+            print(f"[DIAG Probe-4] pos_branch text+special [{0}:{cached_prompt_len}]  "
+                  f"abs_max={_pk_pos_max:.6f}  all_zero={_pk_pos_max < 1e-9}")
+            print(f"[DIAG Probe-4] eoi slot               [{cached_prompt_len}]       "
+                  f"abs_max={_pk_eoi_max:.6f}  all_zero={_pk_eoi_max < 1e-9}")
+            if bs > 1:
+                _nk_pos = _ck_f[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len]
+                _nk_eoi = _ck_f[-1:]
+                print(f"[DIAG Probe-4] neg_branch text+special  abs_max={_nk_pos.abs().max().item():.6f}  "
+                      f"all_zero={_nk_pos.abs().max().item() < 1e-9}")
+            if _pk_pos_max < 1e-9:
+                print(f"[DIAG Probe-4] ❌ pos_branch is ALL ZEROS — inject_prompt_kv_cache failed")
+            else:
+                print(f"[DIAG Probe-4] ✅ pos_branch has valid (non-zero) values")
+            print(f"{'='*60}\n")
+
         key = key.reshape(-1, num_kv_heads, head_dim)
         value = value.reshape(-1, num_kv_heads, head_dim)
 
@@ -1168,6 +1195,19 @@ class ImageKVCacheManager:
 
         # attn_output = attn_output.transpose(1, 2).contiguous()  # [bs, q_len, heads, head_dim]
         attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        # ── Probe-3: record per-layer attn_output for the first denoising step ──
+        # Accumulates results into self._probe3_records (keyed by layer index).
+        # After _forward_with_kv_reuse completes, call
+        #   pipeline._dump_probe3_report() to print per-layer L2 errors vs the
+        #   saved normal-path baseline.
+        _step_idx = getattr(self, "_probe3_step", 0)
+        _layer_idx = getattr(self, "_probe3_layer_idx", -1)
+        if _step_idx == 0 and _layer_idx >= 0:
+            _store = getattr(self, "_probe3_records", {})
+            _store[_layer_idx] = attn_output.detach().float().cpu()
+            self._probe3_records = _store
+
         return attn_output
 
 

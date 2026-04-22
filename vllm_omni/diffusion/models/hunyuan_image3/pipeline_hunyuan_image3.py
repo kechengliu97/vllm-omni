@@ -1292,6 +1292,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
                 generator=generator,
+                system_prompt=system_prompt,
                 **kwargs,
             )
 
@@ -1319,6 +1320,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
         generator: torch.Generator | list[torch.Generator] | None = None,
+        system_prompt: str | None = None,
         **kwargs,
     ) -> DiffusionOutput:
         """Generate image using injected AR text KV cache.
@@ -1389,6 +1391,56 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             use_cfg,
         )
 
+        # ── Probe-0: verify AR KV length matches DiT text-prefix length ──────────
+        _probe_prompt = ""
+        _probe_cot_text = None
+        if req.prompts:
+            _p0 = req.prompts[0]
+            if isinstance(_p0, dict):
+                _probe_prompt = _p0.get("prompt", "") or _p0.get("user_prompt", "") or ""
+                _probe_cot_text = _p0.get("extra", {}).get("ar_generated_text") or None
+        try:
+            _p0_out = self._tkwrapper.apply_chat_template(
+                batch_prompt=[_probe_prompt],
+                batch_message_list=None,
+                mode="gen_image",
+                batch_gen_image_info=[image_info],
+                batch_cond_image_info=None,
+                batch_system_prompt=[system_prompt] if system_prompt else None,
+                batch_cot_text=[_probe_cot_text] if _probe_cot_text else None,
+                max_length=None,
+                bot_task="auto",
+                image_base_size=self.config.image_base_size,
+                sequence_template="pretrain",
+                cfg_factor=1,
+                drop_think=False,
+            )
+            _p0_total = _p0_out["output"].tokens.shape[1]
+            _p0_num_img = num_image_tokens
+            _p0_cached = _p0_total - _p0_num_img - 1  # cached_prompt_len in normal path
+            _p0_L_text_dit = _p0_cached - NUM_SPECIAL_TOKENS
+            print(f"\n{'='*60}")
+            print(f"[DIAG Probe-0] L_pos (AR KV length)    = {L_pos}")
+            print(f"[DIAG Probe-0] L_text_dit (DiT normal) = {_p0_L_text_dit}")
+            print(f"[DIAG Probe-0] cached_prompt_len(DiT)  = {_p0_cached}  "
+                  f"(= L_text_dit + NUM_SPECIAL = {_p0_L_text_dit + NUM_SPECIAL_TOKENS})")
+            print(f"[DIAG Probe-0] total_seq_len(DiT)      = {_p0_total}")
+            print(f"[DIAG Probe-0] num_image_tokens        = {_p0_num_img}")
+            if L_pos == _p0_L_text_dit:
+                print(f"[DIAG Probe-0] ✅ L_pos == L_text_dit: AR KV length matches DiT text prefix")
+            else:
+                _diff = L_pos - _p0_L_text_dit
+                print(f"[DIAG Probe-0] ❌ MISMATCH: L_pos - L_text_dit = {_diff}")
+                if _diff > 0:
+                    print(f"[DIAG Probe-0]    AR KV cache contains {_diff} extra token(s) "
+                          f"(likely CoT/recaption tokens that should NOT be in the KV cache)")
+                else:
+                    print(f"[DIAG Probe-0]    AR KV cache is {-_diff} token(s) shorter than expected "
+                          f"(system_prompt mismatch or BOS handling difference)")
+        except Exception as _probe0_exc:
+            print(f"[DIAG Probe-0] ERROR during DiT tokenize: {_probe0_exc}")
+        print(f"{'='*60}\n")
+
         # 3. Inject KV into each layer's ImageKVCacheManager
         num_layers = len(self.model.layers)
         last_pos_k, last_pos_v = None, None
@@ -1423,6 +1475,36 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
             )
             # Reset RoPE cache: normally cleared by first_step=True, which we skip.
             self.model.layers[layer_idx].self_attn.image_rope2d_emb.custom_pos_emb = None
+
+        # ── Probe-1: check AR KV tensor stats (layer 0) ──────────────────────────
+        _probe1_pk = next((k for k in pos_key_cache if k is not None), None)
+        _probe1_nk = next((k for k in neg_key_cache if k is not None), None) if use_cfg else None
+        if _probe1_pk is not None:
+            _pk_f = _probe1_pk.float()
+            print(f"\n{'='*60}")
+            print(f"[DIAG Probe-1] pos_key shape  : {tuple(_probe1_pk.shape)}")
+            print(f"[DIAG Probe-1] pos_key dtype  : {_probe1_pk.dtype}")
+            print(f"[DIAG Probe-1] pos_key has NaN: {torch.isnan(_pk_f).any().item()}")
+            print(f"[DIAG Probe-1] pos_key has Inf: {torch.isinf(_pk_f).any().item()}")
+            print(f"[DIAG Probe-1] pos_key abs_max : {_pk_f.abs().max().item():.6f}")
+            print(f"[DIAG Probe-1] pos_key abs_mean: {_pk_f.abs().mean().item():.6f}")
+            print(f"[DIAG Probe-1] pos_key all_zero: {(_pk_f.abs().max().item() < 1e-9)}")
+            if _pk_f.abs().max().item() < 1e-9:
+                print(f"[DIAG Probe-1] ❌ pos_key is ALL ZEROS — KV transfer likely failed")
+            elif torch.isnan(_pk_f).any().item() or torch.isinf(_pk_f).any().item():
+                print(f"[DIAG Probe-1] ❌ pos_key contains NaN/Inf — numerical issue in AR stage")
+            else:
+                print(f"[DIAG Probe-1] ✅ pos_key values look valid")
+            if _probe1_nk is not None:
+                _nk_f = _probe1_nk.float()
+                print(f"[DIAG Probe-1] neg_key shape  : {tuple(_probe1_nk.shape)}")
+                print(f"[DIAG Probe-1] neg_key abs_max : {_nk_f.abs().max().item():.6f}")
+                print(f"[DIAG Probe-1] neg_key all_zero: {(_nk_f.abs().max().item() < 1e-9)}")
+                if _nk_f.abs().max().item() < 1e-9:
+                    print(f"[DIAG Probe-1] ❌ neg_key is ALL ZEROS — CFG companion KV transfer failed")
+                else:
+                    print(f"[DIAG Probe-1] ✅ neg_key values look valid")
+            print(f"{'='*60}\n")
 
         # 4. Build custom_pos_emb (2D RoPE)
         # Image sequence after text: [<boi>][<img_size>][<img_ratio>][<timestep>][img×N]
@@ -1475,6 +1557,31 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         # For CFG: mask out padded text positions in the negative branch.
         if use_cfg and L_neg < L_text:
             attention_mask[1, :, :, L_neg:L_text] = False
+
+        # ── Probe-2: verify attention_mask masked-column distribution ─────────────
+        print(f"\n{'='*60}")
+        print(f"[DIAG Probe-2] attention_mask shape: {tuple(attention_mask.shape)}")
+        print(f"[DIAG Probe-2] total_seq_len={total_seq_len}, L_text={L_text}, "
+              f"NUM_SPECIAL={NUM_SPECIAL_TOKENS}, num_image_tokens={num_image_tokens}")
+        for _b in range(bsz):
+            _mask_row = attention_mask[_b, 0, 0, :]
+            _false_cols = (_mask_row == False).nonzero(as_tuple=True)[0].tolist()
+            _true_cnt = int(_mask_row.sum().item())
+            print(f"[DIAG Probe-2] batch[{_b}] visible={_true_cnt}/{total_seq_len}, "
+                  f"masked_cols={_false_cols}")
+        _expected_masked = list(range(L_text, L_text + NUM_SPECIAL_TOKENS)) + [total_seq_len - 1]
+        _pos_false = (attention_mask[0, 0, 0, :] == False).nonzero(as_tuple=True)[0].tolist()
+        _special_masked = all(c in _pos_false for c in range(L_text, L_text + NUM_SPECIAL_TOKENS))
+        _eoi_masked = (total_seq_len - 1) in _pos_false
+        if _special_masked and _eoi_masked:
+            print(f"[DIAG Probe-2] ✅ special tokens [{L_text}:{L_text+NUM_SPECIAL_TOKENS}] and eoi masked correctly")
+        else:
+            if not _special_masked:
+                print(f"[DIAG Probe-2] ❌ special token positions NOT masked! "
+                      f"Expected cols {list(range(L_text, L_text+NUM_SPECIAL_TOKENS))} in masked set")
+            if not _eoi_masked:
+                print(f"[DIAG Probe-2] ❌ eoi position {total_seq_len-1} NOT masked!")
+        print(f"{'='*60}\n")
 
         # 7. Build dummy input_ids (not used for non-first steps, but needed for shape)
         input_ids = torch.zeros(bsz, num_image_tokens, dtype=torch.long, device=device)
