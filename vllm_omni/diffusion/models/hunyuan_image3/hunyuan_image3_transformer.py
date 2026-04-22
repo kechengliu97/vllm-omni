@@ -746,6 +746,9 @@ class LightProjector(nn.Module):
 
         self.layers = modules
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
 
 class HunYuanRotary2DEmbedder:
     r"""
@@ -1000,6 +1003,90 @@ class ImageKVCacheManager:
 
         return joint_text_key.contiguous(), joint_text_value.contiguous()
 
+    def inject_prompt_kv_cache(
+        self,
+        pos_key: torch.Tensor,
+        pos_value: torch.Tensor,
+        neg_key: torch.Tensor | None = None,
+        neg_value: torch.Tensor | None = None,
+        num_special_tokens: int = 3,
+    ) -> int:
+        """Inject pre-computed AR text KV cache into the image KV cache manager.
+
+        This pre-populates ``image_kv_cache_map`` so that subsequent denoising
+        steps can use ``_update_image_kv_caches`` as if the first-step text
+        processing had already occurred.
+
+        The caller (``_forward_with_kv_reuse``) must pass ``kv_injected=True``
+        to the denoising pipeline so that every step is treated as a non-first
+        step (``first_step=False``).  That prevents ``__call__`` from resetting
+        ``image_kv_cache_map`` to ``None`` and recomputing the text KV from the
+        full sequence.  Each denoising step only projects the image-token Q/K/V
+        via the transformer, and the text KV held in ``image_kv_cache_map`` is
+        prepended by ``_update_image_kv_caches`` without being recomputed.
+
+        The ``image_kv_cache_map`` layout must match what ``_save_image_kv_caches``
+        produces on the normal first-step path.  In the normal path the cached
+        prefix length is ``seq_len - image_token_len - 1``, which equals
+        ``L_text + num_special_tokens`` (``<boi>``, ``<img_size>``, ``<img_ratio>``
+        are included in the prefix).  We therefore append ``num_special_tokens``
+        zero-padded slots after the AR-text KV to match that layout exactly.
+
+        Args:
+            pos_key: Positive branch text KV keys ``[pos_len, kv_heads, head_dim]``.
+            pos_value: Positive branch text KV values, same shape as *pos_key*.
+            neg_key: Optional negative/CFG branch text KV keys ``[neg_len, kv_heads, head_dim]``.
+            neg_value: Optional negative/CFG branch text KV values.
+            num_special_tokens: Number of DiT-specific special tokens inserted between
+                the AR text and the image tokens (``<boi>``, ``<img_size>``,
+                ``<img_ratio>``).  Defaults to 3.
+
+        Returns:
+            The (padded) text + special-token prompt length used for the cache
+            (i.e. ``cached_prompt_len`` as seen by ``_update_image_kv_caches``).
+        """
+        kv_heads, head_dim = pos_key.shape[1], pos_key.shape[2]
+        pos_len = pos_key.shape[0]
+        device = pos_key.device
+        dtype = pos_key.dtype
+
+        # Dummy KV slots for DiT-specific special tokens that follow the AR text:
+        # <boi>, <img_size_*>, <img_ratio_*>.  These tokens are not present in the
+        # AR KV cache; we pad with zeros (they are masked in the attention mask).
+        special_k = torch.zeros(num_special_tokens, kv_heads, head_dim, device=device, dtype=dtype)
+        special_v = torch.zeros(num_special_tokens, kv_heads, head_dim, device=device, dtype=dtype)
+
+        # Dummy EOI KV (zeros – masked out by the attention mask)
+        eoi_k = torch.zeros(1, kv_heads, head_dim, device=device, dtype=dtype)
+        eoi_v = torch.zeros(1, kv_heads, head_dim, device=device, dtype=dtype)
+
+        if neg_key is not None:
+            neg_len = neg_key.shape[0]
+            max_len = max(pos_len, neg_len)
+
+            # Pad shorter branch with zeros (masked out by attention)
+            if pos_len < max_len:
+                pad = torch.zeros(max_len - pos_len, kv_heads, head_dim, device=device, dtype=dtype)
+                pos_key = torch.cat([pos_key, pad], dim=0)
+                pos_value = torch.cat([pos_value, pad], dim=0)
+            if neg_len < max_len:
+                pad = torch.zeros(max_len - neg_len, kv_heads, head_dim, device=device, dtype=dtype)
+                neg_key = torch.cat([neg_key, pad], dim=0)
+                neg_value = torch.cat([neg_value, pad], dim=0)
+
+            # Layout: [pos_text, special_pos, eoi_pos, neg_text, special_neg, eoi_neg]
+            # This mirrors _save_image_kv_caches where cached_prompt_len = L_text + num_special_tokens
+            cached_key = torch.cat([pos_key, special_k, eoi_k, neg_key, special_k.clone(), eoi_k.clone()], dim=0)
+            cached_value = torch.cat([pos_value, special_v, eoi_v, neg_value, special_v.clone(), eoi_v.clone()], dim=0)
+            self.image_kv_cache_map = (cached_key, cached_value)
+            return max_len + num_special_tokens
+        else:
+            # Layout: [pos_text, special, eoi]
+            cached_key = torch.cat([pos_key, special_k, eoi_k], dim=0)
+            cached_value = torch.cat([pos_value, special_v, eoi_v], dim=0)
+            self.image_kv_cache_map = (cached_key, cached_value)
+            return pos_len + num_special_tokens
+
     def __call__(
         self,
         query: torch.Tensor,
@@ -1028,6 +1115,11 @@ class ImageKVCacheManager:
         key = key.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
         value = value.reshape(bs, q_len, kv_head_num_per_rank, head_dim)
         if first_step:
+            # NOTE: when AR KV is pre-injected via inject_prompt_kv_cache(),
+            # the pipeline sets first_step=False for every denoising step so
+            # this branch is never entered and the injected cache is preserved.
+            # The else-branch below uses only the image-token K/V (which changes
+            # each step) and prepends the cached text K/V from image_kv_cache_map.
             self.image_kv_cache_map = None
             if self.sp_size <= 1:
                 self._save_image_kv_caches(key, value, seq_len)
@@ -1379,7 +1471,7 @@ class HunyuanImage3ImageProcessor:
                     f"`image_size` should be in the format of 'HxW', 'H:W' or <img_ratio_i>, got {image_size}."
                 )
             assert len(image_size) == 2, f"`image_size` should be in the format of 'HxW', got {image_size}."
-        elif isinstance(image_size, (list, tuple)):
+        elif isinstance(image_size, list | tuple):
             assert len(image_size) == 2 and all(isinstance(s, int) for s in image_size), (
                 f"`image_size` should be a tuple of two integers or a string in the format of 'HxW', got {image_size}."
             )
@@ -2614,6 +2706,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
         model_kwargs: dict[str, Any] | None = None,
+        kv_injected: bool = False,
         **kwargs,
     ):
         r"""
@@ -2674,7 +2767,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         callback_steps = kwargs.pop("callback_steps", None)
         pbar_steps = kwargs.pop("pbar_steps", None)
 
-        if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
+        if isinstance(callback_on_step_end, PipelineCallback | MultiPipelineCallbacks):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
         self._guidance_scale = guidance_scale
@@ -2713,11 +2806,15 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         # (cfg_factor=2) batch before any splitting so that each rank's
         # slice is correct.
         input_ids = model_kwargs.pop("input_ids")
-        attention_mask = self.model._prepare_attention_mask_for_generation(  # noqa
-            input_ids,
-            self.model.generation_config,
-            model_kwargs=model_kwargs,
-        )
+        if kv_injected:
+            # KV reuse path: attention mask is pre-built, skip tokenizer-based mask.
+            attention_mask = model_kwargs.pop("attention_mask")
+        else:
+            attention_mask = self.model._prepare_attention_mask_for_generation(  # noqa
+                input_ids,
+                self.model.generation_config,
+                model_kwargs=model_kwargs,
+            )
 
         # Split inputs for CFG parallel: each rank processes only its branch.
         if cfg_parallel_ready:
@@ -2794,7 +2891,10 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     )
 
                     with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=True):
-                        model_output = self.model.forward_call(**model_inputs, first_step=(i == 0))
+                        model_output = self.model.forward_call(
+                            **model_inputs,
+                            first_step=(i == 0 and not kv_injected),
+                        )
                         pred = model_output["diffusion_prediction"]
                     pred = pred.to(dtype=torch.float32)
 

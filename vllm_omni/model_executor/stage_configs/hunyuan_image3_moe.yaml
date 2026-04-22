@@ -8,17 +8,21 @@
 # Compared to hunyuan_image3_t2i.yaml, this config:
 #   1. Enables both stages [0, 1] for text-to-image (AR prefill + DiT denoising)
 #   2. Adds omni_kv_config to send/receive KV cache between stages
+#   3. Uses prompt_expand_func for CFG companion AR requests
+#   4. Removes kv_transfer_criteria so AR decodes until EOS, then transfers
+#      full KV cache (including think + recaption tokens) to DiT.
 
 # The following config has been verified on 8x L40S-48G GPU (4 for AR + 4 for DiT).
 stage_args:
   - stage_id: 0
     stage_type: llm  # Use llm stage type for AR stages
+    prompt_expand_func: vllm_omni.model_executor.stage_input_processors.hunyuan_image3.expand_cfg_prompts
     runtime:
       process: true  # Run this stage in a separate process
       devices: "0,1,2,3"  # AR stage uses GPU 0-3
     engine_args:
       model_stage: AR
-      max_num_seqs: 1
+      max_num_seqs: 2  # main request + CFG companion
       model_arch: HunyuanImage3ForCausalMM
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -36,8 +40,8 @@ stage_args:
           rope_type: default
       omni_kv_config:
         need_send_cache: true
-        kv_transfer_criteria:
-          type: prefill_finished  # Send KV cache after AR prefill completes
+        # No kv_transfer_criteria: AR decodes until EOS, then transfers full
+        # KV cache (including think + recaption tokens) via _free_request path.
     is_comprehension: true
     final_output: true
     final_output_type: text
@@ -51,6 +55,7 @@ stage_args:
       repetition_penalty: 1.1
   - stage_id: 1
     stage_type: diffusion
+    cfg_kv_collect_func: vllm_omni.model_executor.stage_input_processors.hunyuan_image3.collect_cfg_kv_caches
     runtime:
       process: true
       devices: "4,5,6,7"  # DiT stage uses GPU 4-7

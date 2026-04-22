@@ -576,7 +576,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
             # Use 'if' (not 'elif') so the ManagedBuffer fallback above can
             # convert to Tensor and flow into this branch seamlessly.
-            if isinstance(data, (torch.Tensor, bytes)):
+            if isinstance(data, torch.Tensor | bytes):
                 # Copy Path
                 # 1. Determine size
                 if isinstance(data, torch.Tensor):
@@ -793,9 +793,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Path 3: no metadata at all — query default sender
             if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
                 raise RuntimeError(
-                    f"get(metadata=None) requires sender info to be resolved, "
-                    f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
-                    f"Call update_sender_info(host, port) before using get() without metadata."
+                    f"get({get_key}): sender info not yet resolved "
+                    f"(sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}). "
+                    "Caller must call update_sender_info() before issuing a get with no metadata."
                 )
             metadata = self._query_metadata_from_sender(get_key)
             if not metadata:
